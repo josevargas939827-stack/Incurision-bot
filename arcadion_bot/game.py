@@ -1,6 +1,9 @@
 ﻿from __future__ import annotations
 
+import re
 from dataclasses import dataclass
+import random
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from random import randint
 
@@ -44,6 +47,13 @@ DICE_DAMAGE = {
 
 LOSS_ORDER = ("mechas", "generals", "lieutenants", "rhinos", "bulls")
 REVIVE_ORDER = ("mechas", "generals", "lieutenants", "rhinos", "bulls")
+COUNTERATTACK_WEIGHTS = {
+    "bulls": 70,
+    "rhinos": 20,
+    "lieutenants": 7,
+    "generals": 2,
+    "mechas": 1,
+}
 
 
 @dataclass(frozen=True)
@@ -116,22 +126,24 @@ def roll_dice(count: int) -> DiceRoll:
 def apply_damage_to_units(units: Units, damage: int) -> LossResult:
     remaining = units.as_dict()
     destroyed = {name: 0 for name in UNIT_VALUES}
-    remaining_damage = damage
+    remaining_damage = max(0, damage)
     absorbed = 0
 
     while remaining_damage > 0:
-        destroyed_any = False
-        for unit_name in LOSS_ORDER:
-            value = UNIT_VALUES[unit_name]
-            if remaining[unit_name] > 0 and value <= remaining_damage:
-                remaining[unit_name] -= 1
-                destroyed[unit_name] += 1
-                remaining_damage -= value
-                absorbed += value
-                destroyed_any = True
-                break
-        if not destroyed_any:
+        affordable = [
+            name
+            for name in UNIT_VALUES
+            if remaining[name] > 0 and UNIT_VALUES[name] <= remaining_damage
+        ]
+        if not affordable:
             break
+
+        weights = [COUNTERATTACK_WEIGHTS[name] for name in affordable]
+        selected_name = random.choices(affordable, weights=weights, k=1)[0]
+        remaining[selected_name] -= 1
+        destroyed[selected_name] += 1
+        remaining_damage -= UNIT_VALUES[selected_name]
+        absorbed += UNIT_VALUES[selected_name]
 
     return LossResult(
         remaining=Units(**remaining),
@@ -147,6 +159,87 @@ def format_units(units: Units) -> str:
             label = UNIT_LABELS[name]
             parts.append(f"{amount} {label}{'' if amount == 1 else 's'}")
     return "\n".join(parts) if parts else "No units"
+
+
+def parse_integer(value: str | int) -> int:
+    if isinstance(value, bool):
+        raise ValueError("Invalid numeric value. Accepted formats: 1500000, 1.500.000, 1,500,000, 1500k, 250k, 1.5m, 2m.")
+    if isinstance(value, int):
+        return value
+    if not isinstance(value, str):
+        raise TypeError("Numeric values must be provided as strings or integers.")
+
+    text = value.strip()
+    if not text:
+        raise ValueError("Invalid numeric value. Accepted formats: 1500000, 1.500.000, 1,500,000, 1500k, 250k, 1.5m, 2m.")
+
+    if re.fullmatch(r"\d+(?:[.,]\d+)?[kKmM]", text):
+        number_text = text[:-1]
+        suffix = text[-1].lower()
+        multiplier = 1000 if suffix == "k" else 1000000
+        normalized = number_text.replace(",", ".")
+        try:
+            return int(Decimal(normalized) * multiplier)
+        except InvalidOperation as exc:
+            raise ValueError("Invalid numeric value. Accepted formats: 1500000, 1.500.000, 1,500,000, 1500k, 250k, 1.5m, 2m.") from exc
+
+    if re.fullmatch(r"\d{1,3}(?:[.,]\d{3})+", text):
+        separator = "." if "." in text else ","
+        if text.count(separator) > 0 and text.count(",") > 0 and text.count(".") > 0:
+            raise ValueError("Invalid numeric value. Accepted formats: 1500000, 1.500.000, 1,500,000, 1500k, 250k, 1.5m, 2m.")
+        parts = text.split(separator)
+        if any(not part.isdigit() or len(part) != 3 for part in parts[1:]):
+            raise ValueError("Invalid numeric value. Accepted formats: 1500000, 1.500.000, 1,500,000, 1500k, 250k, 1.5m, 2m.")
+        return int("".join(parts))
+
+    if re.fullmatch(r"\d+", text):
+        return int(text)
+
+    raise ValueError("Invalid numeric value. Accepted formats: 1500000, 1.500.000, 1,500,000, 1500k, 250k, 1.5m, 2m.")
+
+
+def calculate_loot_distribution(total_loot: int, contributions: list[tuple[str, int]]) -> list[dict[str, object]]:
+    total_damage = sum(damage for _, damage in contributions)
+    if total_damage <= 0:
+        return [
+            {
+                "player": player,
+                "damage": damage,
+                "participation_percent": "0%",
+                "reward": 0,
+            }
+            for player, damage in contributions
+        ]
+
+    entries: list[dict[str, object]] = []
+    base_rewards = []
+    for player, damage in contributions:
+        raw_reward = total_loot * damage / total_damage
+        base_rewards.append((player, damage, raw_reward))
+
+    rewards = [int(raw_reward) for _, _, raw_reward in base_rewards]
+    remainder = total_loot - sum(rewards)
+    if remainder > 0:
+        sorted_indices = sorted(
+            range(len(base_rewards)),
+            key=lambda index: (base_rewards[index][2] - rewards[index], -index),
+            reverse=True,
+        )
+        for index in sorted_indices[:remainder]:
+            rewards[index] += 1
+
+    for (player, damage, raw_reward), reward in zip(base_rewards, rewards):
+        participation = (damage / total_damage * 100) if total_damage else 0
+        entries.append(
+            {
+                "player": player,
+                "damage": damage,
+                "participation_percent": f"{round(participation)}%",
+                "reward": reward,
+            }
+        )
+
+    return sorted(entries, key=lambda entry: (-int(entry["reward"]), -int(entry["damage"]), str(entry["player"])))
 
 
 def format_number(value: int) -> str:
