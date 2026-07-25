@@ -123,6 +123,42 @@ def roll_dice(count: int) -> DiceRoll:
     return DiceRoll([randint(1, 6) for _ in range(count)])
 
 
+def roll_arcadion_counterattack_dice() -> DiceRoll:
+    return roll_dice(3)
+
+
+def resolve_surprise_attack(units: Units, damage: int) -> tuple[LossResult, bool]:
+    loss = apply_damage_to_units(units, damage)
+    return loss, not loss.remaining.has_any()
+
+
+def determine_arcadion_phase(current_corruption: int, max_corruption: int) -> int:
+    if max_corruption <= 0:
+        return 1
+    ratio = current_corruption / max_corruption * 100
+    if ratio >= 76:
+        return 1
+    if ratio >= 51:
+        return 2
+    if ratio >= 26:
+        return 3
+    return 4
+
+
+def apply_phase_bonus_to_rolls(rolls: list[int], phase: int) -> list[int]:
+    if phase == 2:
+        adjusted = list(rolls)
+        lowest_index = min(range(len(adjusted)), key=lambda index: adjusted[index])
+        adjusted[lowest_index] = min(6, adjusted[lowest_index] + 1)
+        return adjusted
+    if phase in (3, 4):
+        adjusted = list(rolls)
+        lowest_index = min(range(len(adjusted)), key=lambda index: adjusted[index])
+        adjusted[lowest_index] = min(6, adjusted[lowest_index] + 1)
+        return adjusted
+    return list(rolls)
+
+
 def apply_damage_to_units(units: Units, damage: int) -> LossResult:
     remaining = units.as_dict()
     destroyed = {name: 0 for name in UNIT_VALUES}

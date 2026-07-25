@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Iterator
 
-from .game import ModifierType, RaidState, Units
+from .game import ModifierType, RaidState, Units, apply_damage_to_units
 
 
 class Store:
@@ -69,7 +69,8 @@ class Store:
                     turn_deadline_at TEXT,
                     turn_index INTEGER NOT NULL DEFAULT 0,
                     turn_round INTEGER NOT NULL DEFAULT 1,
-                    announcement_channel_id TEXT
+                    announcement_channel_id TEXT,
+                    turn_reminder_state TEXT NOT NULL DEFAULT 'NONE'
                 );
 
                 CREATE TABLE IF NOT EXISTS raid_participants (
@@ -138,6 +139,7 @@ class Store:
                 ("turn_index", "INTEGER NOT NULL DEFAULT 0"),
                 ("turn_round", "INTEGER NOT NULL DEFAULT 1"),
                 ("announcement_channel_id", "TEXT"),
+                ("turn_reminder_state", "TEXT NOT NULL DEFAULT 'NONE'"),
             ):
                 if column not in raid_columns:
                     conn.execute(f"ALTER TABLE raids ADD COLUMN {column} {definition}")
@@ -330,6 +332,13 @@ class Store:
                 (max(0, total_loot_upx), raid_id),
             )
 
+    def set_turn_reminder_state(self, raid_id: int, reminder_state: str) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE raids SET turn_reminder_state = ? WHERE id = ?",
+                (reminder_state, raid_id),
+            )
+
     def set_announcement_channel(self, raid_id: int, channel_id: int | None) -> None:
         with self.connect() as conn:
             conn.execute(
@@ -355,7 +364,7 @@ class Store:
                 UPDATE raids
                 SET turn_order = ?, current_turn_discord_id = NULL, turn_started_at = NULL,
                     turn_deadline_at = NULL, turn_index = 0, turn_round = 1,
-                    announcement_channel_id = ?
+                    announcement_channel_id = ?, turn_reminder_state = 'NONE'
                 WHERE id = ?
                 """,
                 (json.dumps([]), str(channel_id) if channel_id is not None else None, raid_id),
@@ -368,7 +377,7 @@ class Store:
             """
             UPDATE raids
             SET turn_order = ?, current_turn_discord_id = ?, turn_started_at = ?, turn_deadline_at = ?,
-                turn_index = 0, turn_round = 1, announcement_channel_id = ?
+                turn_index = 0, turn_round = 1, announcement_channel_id = ?, turn_reminder_state = 'NONE'
             WHERE id = ?
             """,
             (json.dumps(active_ids), active_ids[0], now, deadline, str(channel_id) if channel_id is not None else None, raid_id),
@@ -456,7 +465,7 @@ class Store:
                 """
                 UPDATE raids
                 SET current_turn_discord_id = ?, turn_started_at = ?, turn_deadline_at = ?,
-                    turn_index = ?, turn_round = ?, announcement_channel_id = ?
+                    turn_index = ?, turn_round = ?, announcement_channel_id = ?, turn_reminder_state = 'NONE'
                 WHERE id = ?
                 """,
                 (next_id, now, deadline, next_index, round_number, str(channel_id) if channel_id is not None else None, raid_id),
@@ -491,6 +500,49 @@ class Store:
         deadline = datetime.fromisoformat(raid["turn_deadline_at"])
         if datetime.now(timezone.utc) < deadline:
             return None
+
+        with self.connect() as conn:
+            current_player_id = raid["current_turn_discord_id"]
+            if current_player_id:
+                participant = conn.execute(
+                    "SELECT * FROM raid_participants WHERE raid_id = ? AND discord_id = ?",
+                    (raid_id, str(current_player_id)),
+                ).fetchone()
+                if participant is not None and self._participant_has_units_from_id(conn, raid_id, current_player_id):
+                    current_units = Units.from_row(participant)
+                    loss = apply_damage_to_units(current_units, 5000)
+                    conn.execute(
+                        """
+                        UPDATE raid_participants SET
+                            bulls = ?, rhinos = ?, lieutenants = ?, generals = ?, mechas = ?,
+                            lost_bulls = lost_bulls + ?,
+                            lost_rhinos = lost_rhinos + ?,
+                            lost_lieutenants = lost_lieutenants + ?,
+                            lost_generals = lost_generals + ?,
+                            lost_mechas = lost_mechas + ?
+                        WHERE raid_id = ? AND discord_id = ?
+                        """,
+                        (
+                            loss.remaining.bulls,
+                            loss.remaining.rhinos,
+                            loss.remaining.lieutenants,
+                            loss.remaining.generals,
+                            loss.remaining.mechas,
+                            loss.destroyed.bulls,
+                            loss.destroyed.rhinos,
+                            loss.destroyed.lieutenants,
+                            loss.destroyed.generals,
+                            loss.destroyed.mechas,
+                            raid_id,
+                            str(current_player_id),
+                        ),
+                    )
+                    if not loss.remaining.has_any():
+                        conn.execute(
+                            "UPDATE raid_participants SET status = ?, eliminated_at = ? WHERE raid_id = ? AND discord_id = ?",
+                            ("ELIMINATED", utc_now(), raid_id, str(current_player_id)),
+                        )
+
         return self.advance_turn(raid_id, channel_id)
 
     def update_corruption(self, raid_id: int, current_corruption: int) -> None:
