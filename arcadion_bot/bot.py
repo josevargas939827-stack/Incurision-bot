@@ -202,25 +202,25 @@ class ArcadionBot(commands.Bot):
             if is_current_player:
                 if turn_order:
                     conn.execute(
-                        "UPDATE raids SET turn_order = ?, current_turn_discord_id = ?, turn_index = 0, turn_round = 1, turn_started_at = NULL, turn_deadline_at = NULL, announcement_channel_id = ? WHERE id = ?",
-                        (json.dumps(turn_order), turn_order[0], str(channel_id) if channel_id is not None else None, raid_id),
+                        "UPDATE raids SET turn_order = ?, current_turn_discord_id = ?, turn_index = 0, turn_round = 1, turn_started_at = ?, turn_deadline_at = ?, announcement_channel_id = ?, turn_reminder_state = 'NONE' WHERE id = ?",
+                        (json.dumps(turn_order), turn_order[0], utc_now(), (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(), str(channel_id) if channel_id is not None else None, raid_id),
                     )
                 else:
                     conn.execute(
-                        "UPDATE raids SET turn_order = ?, current_turn_discord_id = NULL, turn_started_at = NULL, turn_deadline_at = NULL, turn_index = 0, turn_round = 1, announcement_channel_id = ? WHERE id = ?",
+                        "UPDATE raids SET turn_order = ?, current_turn_discord_id = NULL, turn_started_at = NULL, turn_deadline_at = NULL, turn_index = 0, turn_round = 1, announcement_channel_id = ?, turn_reminder_state = 'NONE' WHERE id = ?",
                         (json.dumps([]), str(channel_id) if channel_id is not None else None, raid_id),
                     )
                     self.clear_raid_leader(raid_id)
             else:
                 conn.execute(
-                    "UPDATE raids SET turn_order = ?, announcement_channel_id = ? WHERE id = ?",
+                    "UPDATE raids SET turn_order = ?, announcement_channel_id = ?, turn_reminder_state = 'NONE' WHERE id = ?",
                     (json.dumps(turn_order), str(channel_id) if channel_id is not None else None, raid_id),
                 )
                 if current_turn is not None and str(current_turn) not in turn_order:
                     if turn_order:
                         conn.execute(
-                            "UPDATE raids SET current_turn_discord_id = ? WHERE id = ?",
-                            (turn_order[0], raid_id),
+                            "UPDATE raids SET current_turn_discord_id = ?, turn_started_at = ?, turn_deadline_at = ?, turn_reminder_state = 'NONE' WHERE id = ?",
+                            (turn_order[0], utc_now(), (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(), raid_id),
                         )
                     else:
                         conn.execute(
@@ -741,8 +741,8 @@ def register_commands(bot: ArcadionBot) -> None:
                 if turn_order:
                     next_player_id = turn_order[0]
                     conn.execute(
-                        "UPDATE raids SET turn_order = ?, current_turn_discord_id = ?, turn_index = 0, turn_round = 1 WHERE id = ?",
-                        (json.dumps(turn_order), next_player_id, raid["id"]),
+                        "UPDATE raids SET turn_order = ?, current_turn_discord_id = ?, turn_index = 0, turn_round = 1, turn_started_at = ?, turn_deadline_at = ?, turn_reminder_state = 'NONE' WHERE id = ?",
+                        (json.dumps(turn_order), next_player_id, utc_now(), (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(), raid["id"]),
                     )
                 else:
                     conn.execute(
@@ -759,8 +759,8 @@ def register_commands(bot: ArcadionBot) -> None:
                 if current_turn_str not in turn_order:
                     if turn_order:
                         conn.execute(
-                            "UPDATE raids SET current_turn_discord_id = ? WHERE id = ?",
-                            (turn_order[0], raid["id"]),
+                            "UPDATE raids SET current_turn_discord_id = ?, turn_started_at = ?, turn_deadline_at = ?, turn_reminder_state = 'NONE' WHERE id = ?",
+                            (turn_order[0], utc_now(), (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat(), raid["id"]),
                         )
                     else:
                         conn.execute(
@@ -1110,6 +1110,9 @@ def main() -> None:
     bot = ArcadionBot(store, settings.guild_id)
     bot.tree.on_error = on_app_command_error
     bot.run(settings.discord_token)
+
+
+
 
 
 
