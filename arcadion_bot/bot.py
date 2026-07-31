@@ -1025,3 +1025,10 @@ def build_wounded_lines(original_health: dict[str, int], remaining_health: dict[
         if original > remaining and remaining > 0:
             lines.append(f"The {names[name]} has been wounded in combat.")
     return lines
+
+
+def main() -> None:
+    settings = load_settings()
+    store = Store(settings.database_path)
+    bot = ArcadionBot(store, settings.guild_id)
+    bot.run(settings.discord_token)
