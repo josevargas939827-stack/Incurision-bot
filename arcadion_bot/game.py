@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import re
 from dataclasses import dataclass
@@ -27,6 +27,8 @@ UNIT_VALUES = {
     "generals": 8500,
     "mechas": 25000,
 }
+
+COMBAT_UNIT_HEALTH = dict(UNIT_VALUES)
 
 UNIT_LABELS = {
     "bulls": "Bull Soldier",
@@ -188,6 +190,61 @@ def apply_damage_to_units(units: Units, damage: int) -> LossResult:
     )
 
 
+def combat_power_from_row(row: object, prefix: str = "") -> int:
+    keys = getattr(row, "keys", lambda: [])()
+    hp_fields = [f"{prefix}{name}_hp" for name in UNIT_VALUES]
+    if all(field in keys for field in hp_fields):
+        hp_values = [max(0, int(row[field])) for field in hp_fields]
+        if any(value > 0 for value in hp_values):
+            return sum(hp_values)
+    return Units.from_row(row, prefix).power()
+
+
+def combat_health_from_row(row: object, prefix: str = "") -> dict[str, int]:
+    keys = getattr(row, "keys", lambda: [])()
+    result: dict[str, int] = {}
+    counts = Units.from_row(row, prefix)
+    for name in UNIT_VALUES:
+        field = f"{prefix}{name}_hp"
+        if field in keys:
+            current_hp = max(0, int(row[field]))
+            if current_hp > 0:
+                result[name] = current_hp
+                continue
+        result[name] = getattr(counts, name) * COMBAT_UNIT_HEALTH[name]
+    return result
+
+
+def apply_wounded_combat_damage(
+    counts: Units,
+    health: dict[str, int],
+    damage: int,
+) -> tuple[Units, Units, dict[str, int], int]:
+    remaining_health = dict(health)
+    remaining_damage = max(0, damage)
+    absorbed = 0
+
+    while remaining_damage > 0:
+        available = [name for name in UNIT_VALUES if remaining_health[name] > 0]
+        if not available:
+            break
+        weights = [COUNTERATTACK_WEIGHTS[name] for name in available]
+        selected_name = random.choices(available, weights=weights, k=1)[0]
+        take = min(remaining_damage, remaining_health[selected_name])
+        remaining_health[selected_name] -= take
+        remaining_damage -= take
+        absorbed += take
+
+    remaining_counts = Units(
+        **{
+            name: 0 if remaining_health[name] <= 0 else (remaining_health[name] + COMBAT_UNIT_HEALTH[name] - 1) // COMBAT_UNIT_HEALTH[name]
+            for name in UNIT_VALUES
+        }
+    )
+    destroyed_counts = Units(
+        **{name: max(0, getattr(counts, name) - getattr(remaining_counts, name)) for name in UNIT_VALUES}
+    )
+    return remaining_counts, destroyed_counts, remaining_health, absorbed
 def format_units(units: Units) -> str:
     parts = []
     for name, amount in units.as_dict().items():
@@ -280,3 +337,4 @@ def calculate_loot_distribution(total_loot: int, contributions: list[tuple[str, 
 
 def format_number(value: int) -> str:
     return f"{value:,}".replace(",", ".")
+

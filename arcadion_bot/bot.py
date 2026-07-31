@@ -1,9 +1,9 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import asyncio
 import json
 import random
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import discord
 from discord import app_commands
@@ -14,7 +14,11 @@ from .game import (
     ModifierType,
     RaidState,
     UNIT_LABELS,
+    UNIT_VALUES,
     Units,
+    apply_wounded_combat_damage,
+    combat_health_from_row,
+    combat_power_from_row,
     apply_damage_to_units,
     calculate_loot_distribution,
     determine_arcadion_phase,
@@ -25,7 +29,7 @@ from .game import (
     roll_arcadion_counterattack_dice,
     roll_dice,
 )
-from .storage import Store
+from .storage import Store, utc_now
 
 ARCADION_THREAT_LINES = [
     "Their resistance is futile.",
@@ -165,10 +169,10 @@ class ArcadionBot(commands.Bot):
             if channel is not None:
                 if current_player is not None:
                     await channel.send(
-                        f"🚫 INACTIVE COMMANDER REMOVED\n\n<@{current_player['discord_id']}> missed too many turns in this raid and has been removed from battle."
+                        f"?? INACTIVE COMMANDER REMOVED\n\n<@{current_player['discord_id']}> missed too many turns in this raid and has been removed from battle."
                     )
                 else:
-                    await channel.send("🚫 INACTIVE COMMANDER REMOVED\n\nA commander has been removed from battle after repeated inactivity.")
+                    await channel.send("?? INACTIVE COMMANDER REMOVED\n\nA commander has been removed from battle after repeated inactivity.")
             updated_raid = self.store.get_raid(raid_id)
             if updated_raid is not None and channel is not None:
                 await announce_turn_change(self, updated_raid, channel)
@@ -179,10 +183,10 @@ class ArcadionBot(commands.Bot):
         if channel is not None:
             if current_player is not None:
                 await channel.send(
-                    f"⚠️ TURN MISSED\n\n<@{current_player['discord_id']}> failed to act in time.\n\nArcadion sensed the hesitation and launched a surprise attack."
+                    f"?? TURN MISSED\n\n<@{current_player['discord_id']}> failed to act in time.\n\nArcadion sensed the hesitation and launched a surprise attack."
                 )
             else:
-                await channel.send("⚠️ TURN MISSED\n\nArcadion sensed the hesitation and launched a surprise attack.")
+                await channel.send("?? TURN MISSED\n\nArcadion sensed the hesitation and launched a surprise attack.")
             if updated_raid is not None:
                 await announce_turn_change(self, updated_raid, channel)
 
@@ -228,6 +232,41 @@ class ArcadionBot(commands.Bot):
                             (raid_id,),
                         )
                         self.clear_raid_leader(raid_id)
+
+
+def select_raid_join_units(units: Units, power_limit: int) -> Units:
+    limit = max(0, int(power_limit))
+    if limit <= 0:
+        return units
+
+    total_power = units.power()
+    if total_power <= limit:
+        return units
+
+    pool: list[str] = []
+    for name, amount in units.as_dict().items():
+        pool.extend([name] * int(amount))
+
+    best_pick = Units()
+    best_power = 0
+    attempts = max(20, len(pool) * 3)
+    for _ in range(attempts):
+        shuffled = list(pool)
+        random.shuffle(shuffled)
+        picked = {name: 0 for name in units.as_dict()}
+        current_power = 0
+        for name in shuffled:
+            value = UNIT_VALUES[name]
+            if current_power + value <= limit:
+                picked[name] += 1
+                current_power += value
+        if current_power > best_power:
+            best_power = current_power
+            best_pick = Units(**picked)
+            if best_power == limit:
+                break
+
+    return best_pick if best_power > 0 else units
 
 
 def units_from_args(bulls: int | str, rhinos: int | str, lieutenants: int | str, generals: int | str, mechas: int | str) -> Units:
@@ -397,11 +436,13 @@ def register_commands(bot: ArcadionBot) -> None:
         arcadion_generals: str = "0",
         arcadion_mechas: str = "0",
         total_loot_upx: str = "0",
+        power_limit: str = "0",
     ) -> None:
         try:
             max_corruption_value = parse_integer(max_corruption)
             duration_hours_value = parse_integer(duration_hours)
             total_loot_value = parse_integer(total_loot_upx)
+            power_limit_value = parse_integer(power_limit)
             arcadion_units = units_from_args(arcadion_bulls, arcadion_rhinos, arcadion_lieutenants, arcadion_generals, arcadion_mechas)
         except ValueError as exc:
             await interaction.response.send_message(str(exc), ephemeral=True)
@@ -414,25 +455,16 @@ def register_commands(bot: ArcadionBot) -> None:
         if active:
             await interaction.response.send_message("There is already an active or recruiting raid.", ephemeral=True)
             return
-        raid_id = bot.store.create_raid(name, city, level, max_corruption_value, duration_hours_value, arcadion_units, total_loot_value)
+        raid_id = bot.store.create_raid(name, city, level, max_corruption_value, duration_hours_value, arcadion_units, total_loot_value, power_limit_value)
         bot.set_raid_leader(raid_id, interaction.user.id)
         raid = bot.store.get_raid(raid_id)
         await interaction.response.send_message(embed=raid_created_embed(raid))
 
     @bot.tree.command(name="raid_join", description="Send troops to the recruiting raid.")
-    async def raid_join(interaction: discord.Interaction, bulls: str = "0", rhinos: str = "0", lieutenants: str = "0", generals: str = "0", mechas: str = "0") -> None:
+    async def raid_join(interaction: discord.Interaction) -> None:
         raid = bot.store.get_active_raid()
         if raid is None or raid["state"] != RaidState.RECRUITING.value:
             await interaction.response.send_message("There is no raid in recruitment.", ephemeral=True)
-            return
-
-        try:
-            sent = units_from_args(bulls, rhinos, lieutenants, generals, mechas)
-        except ValueError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
-            return
-        if not sent.has_any():
-            await interaction.response.send_message("You must send at least one unit.", ephemeral=True)
             return
 
         participant = bot.store.get_participant(raid["id"], interaction.user.id)
@@ -444,11 +476,14 @@ def register_commands(bot: ArcadionBot) -> None:
         if player is None:
             await interaction.response.send_message("Register your army with `/army_set` first.", ephemeral=True)
             return
+
         permanent = Units.from_row(player)
-        if not permanent.contains(sent):
-            await interaction.response.send_message("You cannot send more units than you have in your permanent army.", ephemeral=True)
+        if not permanent.has_any():
+            await interaction.response.send_message("Register your army with `/army_set` first.", ephemeral=True)
             return
 
+        raid_power_limit = int(raid["power_limit"] or 0)
+        sent = select_raid_join_units(permanent, raid_power_limit)
         bot.store.upsert_participant(raid["id"], interaction.user.id, interaction.user.display_name, sent)
         await interaction.response.send_message(embed=joined_embed(interaction.user.display_name, sent))
 
@@ -459,11 +494,12 @@ def register_commands(bot: ArcadionBot) -> None:
         if raid is None or raid["state"] != RaidState.RECRUITING.value:
             await interaction.response.send_message("There is no recruiting raid to start.", ephemeral=True)
             return
-        if bot.get_raid_leader(raid["id"]) != interaction.user.id:
+        leader_id = bot.get_raid_leader(raid["id"])
+        if leader_id is None and interaction.user.guild_permissions.manage_guild:
+            bot.set_raid_leader(raid["id"], interaction.user.id)
+            leader_id = interaction.user.id
+        if leader_id != interaction.user.id:
             await interaction.response.send_message("Only the raid leader can use this command.", ephemeral=True)
-            return
-        if not bot.store.list_active_participants(raid["id"]):
-            await interaction.response.send_message("The raid cannot start without participants.", ephemeral=True)
             return
         bot.store.start_raid(raid["id"], interaction.channel_id)
         raid = bot.store.get_raid(raid["id"])
@@ -525,30 +561,15 @@ def register_commands(bot: ArcadionBot) -> None:
 
         if raid["turn_deadline_at"] and datetime.fromisoformat(raid["turn_deadline_at"]) <= datetime.now(timezone.utc):
             current_player = bot.store.get_participant(raid["id"], raid["current_turn_discord_id"])
-            bot.cancel_turn_timeout(raid["id"])
-            bot.store.process_turn_timeout(raid["id"], interaction.channel_id)
-            raid = bot.store.get_active_raid()
-            if interaction.channel:
-                if current_player is not None:
-                    await interaction.channel.send(
-                        f"⚠️ TURN MISSED\n\n<@{current_player['discord_id']}> failed to act in time.\n\nArcadion sensed the hesitation and launched a surprise attack."
-                    )
-                else:
-                    await interaction.channel.send(
-                        "⚠️ TURN MISSED\n\nArcadion sensed the hesitation and launched a surprise attack."
-                    )
-                await announce_turn_change(bot, raid, interaction.channel)
-            await interaction.response.send_message("Arcadion launched a surprise attack and the turn passed to the next commander.", ephemeral=True)
-            return
-
         bot.cancel_turn_timeout(raid["id"])
         dice_count = attack_dice_count(bot.store, raid["id"], interaction.user.id)
         attacker_roll = roll_dice(dice_count)
         arcadion_guard = Units.from_row(raid, "arcadion_")
-        guard_loss = apply_damage_to_units(arcadion_guard, attacker_roll.damage)
-        damage_to_corruption = max(0, attacker_roll.damage - guard_loss.absorbed_damage)
+        arcadion_guard_health = combat_health_from_row(raid, "arcadion_")
+        guard_remaining, guard_destroyed, guard_remaining_health, guard_absorbed = apply_wounded_combat_damage(arcadion_guard, arcadion_guard_health, attacker_roll.damage)
+        damage_to_corruption = max(0, attacker_roll.damage - guard_absorbed)
         new_corruption = max(0, int(raid["current_corruption"]) - damage_to_corruption)
-        bot.store.update_arcadion_units(raid["id"], guard_loss.remaining)
+        bot.store.update_arcadion_units(raid["id"], guard_remaining, guard_remaining_health)
         bot.store.update_corruption(raid["id"], new_corruption)
         bot.store.add_attack_stats(raid["id"], interaction.user.id, attacker_roll.damage)
 
@@ -556,29 +577,31 @@ def register_commands(bot: ArcadionBot) -> None:
         arcadion_roll = roll_arcadion_counterattack_dice()
         target = None
         if active_targets:
-            target_powers = [(row, Units.from_row(row).power()) for row in active_targets]
+            target_powers = [(row, combat_power_from_row(row)) for row in active_targets]
             highest_power = max(power for _, power in target_powers)
             strongest_targets = [row for row, power in target_powers if power == highest_power]
             target = random.choice(strongest_targets) if len(strongest_targets) > 1 else strongest_targets[0]
         destroyed = Units()
+        wounded_lines: list[str] = []
         counterattack_message = None
         if target is not None:
             target_units = Units.from_row(target)
-            loss = apply_damage_to_units(target_units, arcadion_roll.damage)
-            destroyed = loss.destroyed
-            bot.store.update_participant_units_and_losses(raid["id"], target["discord_id"], loss.remaining, loss.destroyed)
+            target_health = combat_health_from_row(target)
+            remaining_units, destroyed_units, remaining_health, absorbed_damage = apply_wounded_combat_damage(target_units, target_health, arcadion_roll.damage)
+            destroyed = destroyed_units
+            wounded_lines = build_wounded_lines(target_health, remaining_health, remaining_units)
+            bot.store.update_participant_units_and_losses(raid["id"], target["discord_id"], remaining_units, destroyed_units, remaining_health)
             counterattack_message = counterattack_summary(
                 target["discord_name"],
                 arcadion_roll.damage,
                 destroyed,
-                loss.remaining,
+                remaining_units,
                 arcadion_roll.text,
             )
-            if bot.store.mark_participant_eliminated_if_needed(raid["id"], target["discord_id"], loss.remaining):
+            if bot.store.mark_participant_eliminated_if_needed(raid["id"], target["discord_id"], remaining_units):
                 await interaction.channel.send(
-                    f"💀 COMMANDER ELIMINATED\n\nThe army of @{target['discord_name']} has been completely destroyed.\n\nThis commander has been eliminated from the current raid and can no longer participate.\n\nHowever, all damage dealt and battle statistics have been recorded.\n\nThe commander will still receive rewards based on their contribution when the raid ends."
+                    f"?? COMMANDER ELIMINATED\n\nThe army of @{target['discord_name']} has been completely destroyed.\n\nThis commander has been eliminated from the current raid and can no longer participate.\n\nHowever, all damage dealt and battle statistics have been recorded.\n\nThe commander will still receive rewards based on their contribution when the raid ends."
                 )
-
         bot.store.log_attack(
             raid["id"],
             interaction.user.id,
@@ -610,7 +633,7 @@ def register_commands(bot: ArcadionBot) -> None:
         elif not bot.store.list_active_participants(raid["id"]):
             bot.cancel_turn_timeout(raid["id"])
             bot.store.finish_raid(raid["id"], "ARCADION")
-            result_message = "☠️ ARCADION IS VICTORIOUS\n\nAll deployed armies have been destroyed.\n\nThe city has fallen under Arcadion's corruption.\n\nRaid Failed."
+            result_message = "?? ARCADION IS VICTORIOUS\n\nAll deployed armies have been destroyed.\n\nThe city has fallen under Arcadion's corruption.\n\nRaid Failed."
             completed_raid = bot.store.get_raid(raid["id"])
             completed_raid = {**completed_raid, "result": "FAILED"}
         else:
@@ -632,8 +655,9 @@ def register_commands(bot: ArcadionBot) -> None:
                     arcadion_roll=arcadion_roll,
                     target_name=target["discord_name"] if target else "No one",
                     destroyed=destroyed,
-                    arcadion_guard_destroyed=guard_loss.destroyed,
+                    arcadion_guard_destroyed=guard_destroyed,
                     damage_to_corruption=damage_to_corruption,
+                    wounded_lines=wounded_lines,
                     result_message=result_message,
                 )
             )
@@ -686,7 +710,7 @@ def register_commands(bot: ArcadionBot) -> None:
                 return
             source_unit, promoted_label = promote_soldier(bot.store, raid["id"], interaction.user.id, units)
             bot.store.set_modifier(raid["id"], interaction.user.id, modifier, 0, 2, source_unit)
-            await interaction.response.send_message(f"🛡️ **SOLDIER ASCENDS**\nOne {promoted_label} temporarily becomes a Lion Lieutenant for 2 turns.")
+            await interaction.response.send_message(f"??? **SOLDIER ASCENDS**\nOne {promoted_label} temporarily becomes a Lion Lieutenant for 2 turns.")
 
     @bot.tree.command(name="modifier_apply", description="Apply a modifier to a participant.")
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -709,7 +733,7 @@ def register_commands(bot: ArcadionBot) -> None:
             return
         modifier = ModifierType(modifier.value)
         bot.store.set_modifier(raid["id"], user.id, modifier, 0, 2)
-        await interaction.response.send_message(f"💀 **FALLEN LIEUTENANT**\n{user.display_name} will attack with 1 die for 2 turns.")
+        await interaction.response.send_message(f"?? **FALLEN LIEUTENANT**\n{user.display_name} will attack with 1 die for 2 turns.")
 
     @bot.tree.command(name="raid_kick", description="Remove a player from the active raid.")
     @app_commands.checks.has_permissions(manage_guild=True)
@@ -839,11 +863,11 @@ async def announce_turn_change(bot: ArcadionBot, raid: object, channel: discord.
     participant = Units.from_row(current_player)
     phase = determine_arcadion_phase(int(raid["current_corruption"]), int(raid["max_corruption"]))
     phase_header = {
-        1: "🜂 ARCADION STANDS UNBROKEN",
-        2: "🔥 ARCADION GROWS ENRAGED",
-        3: "☣️ ARCADION BECOMES CORRUPTED",
-        4: "🩸 ARCADION ENTERS BERSERK STATE",
-    }.get(phase, "🎯 COMMANDER TURN")
+        1: "?? ARCADION STANDS UNBROKEN",
+        2: "?? ARCADION GROWS ENRAGED",
+        3: "?? ARCADION BECOMES CORRUPTED",
+        4: "?? ARCADION ENTERS BERSERK STATE",
+    }.get(phase, "?? COMMANDER TURN")
     phase_message = {
         1: "Normal State",
         2: "Enraged State",
@@ -863,9 +887,9 @@ async def announce_turn_reminder(bot: ArcadionBot, raid: object, channel: discor
     if current_player is None:
         return
     if minutes == 2:
-        await channel.send(f"⏳ Reminder\n\n<@{current_player['discord_id']}>\n\n2 minutes remaining.\n\nAttack Arcadion before your turn expires.")
+        await channel.send(f"? Reminder\n\n<@{current_player['discord_id']}>\n\n2 minutes remaining.\n\nAttack Arcadion before your turn expires.")
     elif minutes == 1:
-        await channel.send(f"⚠️ Final Reminder\n\n<@{current_player['discord_id']}>\n\nOnly 1 minute remaining.\n\nAttack now or Arcadion will launch a surprise attack.")
+        await channel.send(f"?? Final Reminder\n\n<@{current_player['discord_id']}>\n\nOnly 1 minute remaining.\n\nAttack now or Arcadion will launch a surprise attack.")
 
 
 def revive_one_unit(store: Store, raid_id: int, discord_id: int, participant: object) -> str | None:
@@ -922,25 +946,26 @@ def army_embed(name: str, units: Units, title: str) -> discord.Embed:
 
 
 def raid_created_embed(raid: object) -> discord.Embed:
-    embed = discord.Embed(title=f"☄️ {raid['name']} appears in {raid['city']}", color=0x8B0000)
+    embed = discord.Embed(title=f"?? {raid['name']} appears in {raid['city']}", color=0x8B0000)
     embed.add_field(name="Status", value=raid["state"], inline=True)
     embed.add_field(name="Level", value=raid["level"], inline=True)
     embed.add_field(name="Corruption", value=f"{format_number(raid['current_corruption'])} / {format_number(raid['max_corruption'])}", inline=False)
     embed.add_field(name="Corrupted Army", value=format_units(Units.from_row(raid, "arcadion_")), inline=False)
     embed.add_field(name="Corrupted Army Power", value=format_number(Units.from_row(raid, "arcadion_").power()), inline=False)
+    embed.add_field(name="Military Power Limit", value=format_number(int(raid["power_limit"] or 0)) if int(raid["power_limit"] or 0) > 0 else "No limit", inline=False)
     embed.add_field(name="Recruitment", value="Use `/raid_join` to send troops.", inline=False)
     return embed
 
 
 def joined_embed(name: str, units: Units) -> discord.Embed:
-    embed = discord.Embed(title=f"🛡️ {name} joins the raid", color=0x2E8B57)
+    embed = discord.Embed(title=f"??? {name} joins the raid", color=0x2E8B57)
     embed.add_field(name="Troops Sent", value=format_units(units), inline=False)
     embed.add_field(name="Raid Power", value=format_number(units.power()), inline=False)
     return embed
 
 
 def battle_started_embed(raid: object, first_player_name: str) -> discord.Embed:
-    embed = discord.Embed(title=f"🔥 BATTLE STARTED: {raid['name']}", color=0xB22222)
+    embed = discord.Embed(title=f"?? BATTLE STARTED: {raid['name']}", color=0xB22222)
     embed.add_field(name="City", value=raid["city"], inline=True)
     embed.add_field(name="Ends At", value=raid["ends_at"], inline=False)
     embed.add_field(name="Current Turn", value=first_player_name, inline=False)
@@ -958,6 +983,7 @@ def attack_embed(
     destroyed: Units,
     arcadion_guard_destroyed: Units,
     damage_to_corruption: int,
+    wounded_lines: list[str] | None,
     result_message: str | None,
 ) -> discord.Embed:
     embed = discord.Embed(title=f"?? {attacker_name.upper()} ATTACKS", color=0xDAA520)
@@ -975,162 +1001,27 @@ def attack_embed(
     embed.add_field(name="Damage", value=format_number(arcadion_roll.damage), inline=True)
     embed.add_field(name="Target", value=target_name, inline=False)
     embed.add_field(name="Destroyed Units", value=format_units(destroyed), inline=False)
+    if wounded_lines:
+        embed.add_field(name="Wounded Units", value="\n".join(wounded_lines), inline=False)
     if result_message:
         embed.add_field(name="Result", value=result_message, inline=False)
     return embed
 
 
-def counterattack_summary(target_name: str, damage: int, destroyed: Units, remaining: Units, arcadion_dice: str | None = None) -> str:
-    lines = [
-        "?? Arcadion Counterattack!",
-        "",
-        "Damage Dealt:",
-        f"{format_number(damage)}",
-    ]
-    if arcadion_dice:
-        lines.extend(["", f"Dice: {arcadion_dice}"])
-    lines.extend(["", "Units Destroyed"])
-
-    destroyed_any = False
-    for field in ("bulls", "rhinos", "lieutenants", "generals", "mechas"):
-        amount = getattr(destroyed, field)
-        if amount > 0:
-            destroyed_any = True
-            label = UNIT_LABELS[field]
-            lines.append(f"-{amount} {label}{'' if amount == 1 else 's'}")
-
-    if not destroyed_any:
-        lines.append("-No units destroyed")
-
-    lines.extend(["", "Remaining Army"])
-    for field in ("bulls", "rhinos", "lieutenants", "generals", "mechas"):
-        amount = getattr(remaining, field)
-        if amount > 0:
-            label = UNIT_LABELS[field]
-            lines.append(f"{label}: {amount}")
-
-    if not any(getattr(remaining, field) > 0 for field in ("bulls", "rhinos", "lieutenants", "generals", "mechas")):
-        lines.append("All units destroyed")
-
-    lines.extend(["", "Remaining Military Power", f"{format_number(remaining.power())}"])
-    return "\n".join(lines)
-
-
-def status_embed(raid: object, participants: list[object]) -> discord.Embed:
-    current = int(raid["current_corruption"])
-    maximum = int(raid["max_corruption"])
-    completed = 100 if maximum <= 0 else round((1 - current / maximum) * 100, 2)
-    remaining_power = sum(Units.from_row(row).power() for row in participants)
-    top = participants[:5]
-    top_text = "\n".join(
-        f"{index + 1}. {row['discord_name']} - {format_number(row['damage_done'])} damage ({row['attacks']} attacks)"
-        for index, row in enumerate(top)
-    )
-    embed = discord.Embed(title=f"📜 Raid Status: {raid['name']}", color=0x4169E1)
-    embed.add_field(name="Status", value=raid["state"], inline=True)
-    embed.add_field(name="City", value=raid["city"], inline=True)
-    arcadion_guard = Units.from_row(raid, "arcadion_")
-    embed.add_field(name="Corruption", value=f"{format_number(current)} / {format_number(maximum)}", inline=False)
-    embed.add_field(name="Arcadion Army", value=format_units(arcadion_guard), inline=False)
-    embed.add_field(name="Arcadion Army Power", value=format_number(arcadion_guard.power()), inline=True)
-    embed.add_field(name="Progress", value=f"{completed}%", inline=True)
-    embed.add_field(name="Participants", value=str(len(participants)), inline=True)
-    embed.add_field(name="Remaining Military Power", value=format_number(remaining_power), inline=False)
-    embed.add_field(name="Top Damage", value=top_text or "No attacks recorded", inline=False)
-    return embed
-
-
-def finished_embed(raid: object, message: str) -> discord.Embed:
-    embed = discord.Embed(title=f"🏁 FINISHED: {raid['name']}", description=message, color=0x696969)
-    return embed
-
-
-def loot_summary_embed(raid: object, participants: list[object], result_message: str | None = None) -> discord.Embed:
-    total_loot = int(raid["total_loot_upx"] or 0)
-    total_damage = sum(int(row["damage_done"]) for row in participants)
-    is_success = str(raid["result"] or "").upper() == "SUCCESS"
-    is_victory = bool(result_message and "defeated" in result_message.lower())
-    is_success = is_success or is_victory
-
-    ranked_participants = sorted(
-        participants,
-        key=lambda row: (-int(row["damage_done"]), row["discord_name"].lower()),
-    )
-    contributions = [(row["discord_name"], int(row["damage_done"])) for row in ranked_participants if int(row["damage_done"]) > 0]
-    distribution = calculate_loot_distribution(total_loot, contributions) if contributions else []
-    reward_map = {entry["player"]: int(entry["reward"]) for entry in distribution}
-    embed = discord.Embed(title="🏆 RAID RESULTS", color=0xFFD700)
-    embed.add_field(name="Raid Outcome", value="SUCCESS" if is_success else "FAILED", inline=False)
-    embed.add_field(name="Total UPX Loot", value=f"{format_number(total_loot)} UPX", inline=False)
-    embed.add_field(name="Total Damage", value=f"{format_number(total_damage)} damage", inline=False)
-
-    history_lines = []
-    if ranked_participants:
-        for index, row in enumerate(ranked_participants, start=1):
-            damage_done = int(row["damage_done"])
-            contribution_percent = 0 if total_damage <= 0 else round((damage_done / total_damage) * 100, 1)
-            reward = reward_map.get(row["discord_name"], 0) if is_success else 0
-            history_lines.append(
-                f"{index}. {row['discord_name']} | Damage: {format_number(damage_done)} | Share: {contribution_percent:.1f}% | Attacks: {int(row['attacks'])} | Lost Units: {int(row['lost_bulls']) + int(row['lost_rhinos']) + int(row['lost_lieutenants']) + int(row['lost_generals']) + int(row['lost_mechas'])} | UPX: {format_number(reward)}"
-            )
-    else:
-        history_lines.append("No participants were recorded.")
-
-    loot_lines = []
-    if is_success:
-        if distribution:
-            for entry in distribution:
-                contribution_percent = 0 if total_damage <= 0 else round((int(entry["damage"]) / total_damage) * 100, 1)
-                loot_lines.append(
-                    f"{entry['player']} | Damage: {format_number(int(entry['damage']))} | Share: {contribution_percent:.1f}% | Reward: {format_number(int(entry['reward']))} UPX"
-                )
-        else:
-            loot_lines.append("No damage was dealt, so no UPX was distributed.")
-    else:
-        loot_lines.append("The raid failed, so no UPX was distributed.")
-
-    embed.add_field(name="Battle History", value="\n".join(history_lines)[:1024], inline=False)
-    embed.add_field(name="UPX Distribution", value="\n".join(loot_lines)[:1024], inline=False)
-
-    if result_message:
-        embed.add_field(name="Result", value=result_message, inline=False)
-    return embed
-
-
-async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
-    if isinstance(error, app_commands.MissingPermissions):
-        await interaction.response.send_message("You need administrator permissions to use this command.", ephemeral=True)
-        return
-    raise error
-
-
-def main() -> None:
-    settings = load_settings()
-    store = Store(settings.database_path)
-    bot = ArcadionBot(store, settings.guild_id)
-    bot.tree.on_error = on_app_command_error
-    bot.run(settings.discord_token)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+def build_wounded_lines(original_health: dict[str, int], remaining_health: dict[str, int], remaining_units: Units) -> list[str]:
+    lines: list[str] = []
+    names = {
+        "bulls": "Bull Soldier",
+        "rhinos": "Rhino Soldier",
+        "lieutenants": "Lion Lieutenant",
+        "generals": "General",
+        "mechas": "Mecha",
+    }
+    for name in ("bulls", "rhinos", "lieutenants", "generals", "mechas"):
+        if getattr(remaining_units, name) <= 0:
+            continue
+        original = int(original_health.get(name, 0))
+        remaining = int(remaining_health.get(name, 0))
+        if original > remaining and remaining > 0:
+            lines.append(f"The {names[name]} has been wounded in combat.")
+    return lines

@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import os
@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Iterator
 
-from .game import ModifierType, RaidState, Units, apply_damage_to_units
+from .game import COMBAT_UNIT_HEALTH, ModifierType, RaidState, Units, apply_damage_to_units, apply_wounded_combat_damage, combat_health_from_row, combat_power_from_row
 
 
 class Store:
@@ -40,6 +40,11 @@ class Store:
                     lieutenants INTEGER NOT NULL DEFAULT 0,
                     generals INTEGER NOT NULL DEFAULT 0,
                     mechas INTEGER NOT NULL DEFAULT 0,
+                    bulls_hp INTEGER NOT NULL DEFAULT 0,
+                    rhinos_hp INTEGER NOT NULL DEFAULT 0,
+                    lieutenants_hp INTEGER NOT NULL DEFAULT 0,
+                    generals_hp INTEGER NOT NULL DEFAULT 0,
+                    mechas_hp INTEGER NOT NULL DEFAULT 0,
                     updated_at TEXT NOT NULL
                 );
 
@@ -55,6 +60,11 @@ class Store:
                     arcadion_lieutenants INTEGER NOT NULL DEFAULT 0,
                     arcadion_generals INTEGER NOT NULL DEFAULT 0,
                     arcadion_mechas INTEGER NOT NULL DEFAULT 0,
+                    arcadion_bulls_hp INTEGER NOT NULL DEFAULT 0,
+                    arcadion_rhinos_hp INTEGER NOT NULL DEFAULT 0,
+                    arcadion_lieutenants_hp INTEGER NOT NULL DEFAULT 0,
+                    arcadion_generals_hp INTEGER NOT NULL DEFAULT 0,
+                    arcadion_mechas_hp INTEGER NOT NULL DEFAULT 0,
                     duration_hours INTEGER NOT NULL,
                     state TEXT NOT NULL,
                     started_at TEXT,
@@ -63,6 +73,7 @@ class Store:
                     finished_at TEXT,
                     result TEXT,
                     total_loot_upx INTEGER NOT NULL DEFAULT 0,
+                    power_limit INTEGER NOT NULL DEFAULT 0,
                     turn_order TEXT,
                     current_turn_discord_id TEXT,
                     turn_started_at TEXT,
@@ -82,6 +93,11 @@ class Store:
                     lieutenants INTEGER NOT NULL DEFAULT 0,
                     generals INTEGER NOT NULL DEFAULT 0,
                     mechas INTEGER NOT NULL DEFAULT 0,
+                    bulls_hp INTEGER NOT NULL DEFAULT 0,
+                    rhinos_hp INTEGER NOT NULL DEFAULT 0,
+                    lieutenants_hp INTEGER NOT NULL DEFAULT 0,
+                    generals_hp INTEGER NOT NULL DEFAULT 0,
+                    mechas_hp INTEGER NOT NULL DEFAULT 0,
                     lost_bulls INTEGER NOT NULL DEFAULT 0,
                     lost_rhinos INTEGER NOT NULL DEFAULT 0,
                     lost_lieutenants INTEGER NOT NULL DEFAULT 0,
@@ -124,14 +140,21 @@ class Store:
                 );
                 """
             )
-            raid_columns = {row["name"] for row in conn.execute("PRAGMA table_info(raids)")}
-            for column in ("arcadion_bulls", "arcadion_rhinos", "arcadion_lieutenants", "arcadion_generals", "arcadion_mechas"):
-                if column not in raid_columns:
-                    conn.execute(f"ALTER TABLE raids ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
 
             raid_columns = {row["name"] for row in conn.execute("PRAGMA table_info(raids)")}
             for column, definition in (
+                ("arcadion_bulls", "INTEGER NOT NULL DEFAULT 0"),
+                ("arcadion_rhinos", "INTEGER NOT NULL DEFAULT 0"),
+                ("arcadion_lieutenants", "INTEGER NOT NULL DEFAULT 0"),
+                ("arcadion_generals", "INTEGER NOT NULL DEFAULT 0"),
+                ("arcadion_mechas", "INTEGER NOT NULL DEFAULT 0"),
+                ("arcadion_bulls_hp", "INTEGER NOT NULL DEFAULT 0"),
+                ("arcadion_rhinos_hp", "INTEGER NOT NULL DEFAULT 0"),
+                ("arcadion_lieutenants_hp", "INTEGER NOT NULL DEFAULT 0"),
+                ("arcadion_generals_hp", "INTEGER NOT NULL DEFAULT 0"),
+                ("arcadion_mechas_hp", "INTEGER NOT NULL DEFAULT 0"),
                 ("total_loot_upx", "INTEGER NOT NULL DEFAULT 0"),
+                ("power_limit", "INTEGER NOT NULL DEFAULT 0"),
                 ("turn_order", "TEXT"),
                 ("current_turn_discord_id", "TEXT"),
                 ("turn_started_at", "TEXT"),
@@ -150,6 +173,11 @@ class Store:
                 ("turns_played", "INTEGER NOT NULL DEFAULT 0"),
                 ("status", "TEXT NOT NULL DEFAULT 'ACTIVE'"),
                 ("eliminated_at", "TEXT"),
+                ("bulls_hp", "INTEGER NOT NULL DEFAULT 0"),
+                ("rhinos_hp", "INTEGER NOT NULL DEFAULT 0"),
+                ("lieutenants_hp", "INTEGER NOT NULL DEFAULT 0"),
+                ("generals_hp", "INTEGER NOT NULL DEFAULT 0"),
+                ("mechas_hp", "INTEGER NOT NULL DEFAULT 0"),
             ):
                 if column not in participant_columns:
                     conn.execute(f"ALTER TABLE raid_participants ADD COLUMN {column} {definition}")
@@ -273,6 +301,7 @@ class Store:
         duration_hours: int,
         arcadion_units: Units | None = None,
         total_loot_upx: int = 0,
+        power_limit: int = 0,
     ) -> int:
         now = utc_now()
         arcadion_units = arcadion_units or Units()
@@ -282,17 +311,71 @@ class Store:
                 INSERT INTO raids (
                     name, city, level, max_corruption, current_corruption,
                     arcadion_bulls, arcadion_rhinos, arcadion_lieutenants, arcadion_generals, arcadion_mechas,
-                    duration_hours, state, created_at, total_loot_upx
+                    arcadion_bulls_hp, arcadion_rhinos_hp, arcadion_lieutenants_hp, arcadion_generals_hp, arcadion_mechas_hp,
+                    duration_hours, state, created_at, total_loot_upx, power_limit
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    name, city, level, max_corruption, max_corruption,
-                    arcadion_units.bulls, arcadion_units.rhinos, arcadion_units.lieutenants, arcadion_units.generals, arcadion_units.mechas,
-                    duration_hours, RaidState.RECRUITING.value, now, total_loot_upx,
+                    name,
+                    city,
+                    level,
+                    max_corruption,
+                    max_corruption,
+                    arcadion_units.bulls,
+                    arcadion_units.rhinos,
+                    arcadion_units.lieutenants,
+                    arcadion_units.generals,
+                    arcadion_units.mechas,
+                    arcadion_units.bulls * COMBAT_UNIT_HEALTH["bulls"],
+                    arcadion_units.rhinos * COMBAT_UNIT_HEALTH["rhinos"],
+                    arcadion_units.lieutenants * COMBAT_UNIT_HEALTH["lieutenants"],
+                    arcadion_units.generals * COMBAT_UNIT_HEALTH["generals"],
+                    arcadion_units.mechas * COMBAT_UNIT_HEALTH["mechas"],
+                    duration_hours,
+                    RaidState.RECRUITING.value,
+                    now,
+                    total_loot_upx,
+                    power_limit,
                 ),
             )
             return int(cursor.lastrowid)
+
+    def update_corruption(self, raid_id: int, current_corruption: int) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                "UPDATE raids SET current_corruption = ? WHERE id = ?",
+                (max(0, current_corruption), raid_id),
+            )
+
+    def update_arcadion_units(self, raid_id: int, units: Units, health: dict[str, int] | None = None) -> None:
+        health = health or {name: getattr(units, name) * COMBAT_UNIT_HEALTH[name] for name in units.as_dict()}
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE raids SET
+                    arcadion_bulls = ?, arcadion_bulls_hp = ?,
+                    arcadion_rhinos = ?, arcadion_rhinos_hp = ?,
+                    arcadion_lieutenants = ?, arcadion_lieutenants_hp = ?,
+                    arcadion_generals = ?, arcadion_generals_hp = ?,
+                    arcadion_mechas = ?, arcadion_mechas_hp = ?
+                WHERE id = ?
+                """,
+                (
+                    units.bulls,
+                    health["bulls"],
+                    units.rhinos,
+                    health["rhinos"],
+                    units.lieutenants,
+                    health["lieutenants"],
+                    units.generals,
+                    health["generals"],
+                    units.mechas,
+                    health["mechas"],
+                    raid_id,
+                ),
+            )
+
 
     def get_active_raid(self) -> sqlite3.Row | None:
         with self.connect() as conn:
@@ -357,7 +440,7 @@ class Store:
                 (raid_id,),
             )
         )
-        active_ids = [row["discord_id"] for row in participants if self._participant_has_units(row)]
+        active_ids = [str(row["discord_id"]) for row in participants if self._participant_has_units(row)]
         if not active_ids:
             conn.execute(
                 """
@@ -388,11 +471,30 @@ class Store:
         if str(status or "ACTIVE") == "ELIMINATED":
             return False
         return (
-            int(participant["bulls"])
-            + int(participant["rhinos"])
-            + int(participant["lieutenants"])
-            + int(participant["generals"])
-            + int(participant["mechas"])
+            int(participant["bulls_hp"] or 0)
+            + int(participant["rhinos_hp"] or 0)
+            + int(participant["lieutenants_hp"] or 0)
+            + int(participant["generals_hp"] or 0)
+            + int(participant["mechas_hp"] or 0)
+            > 0
+        )
+
+    def _participant_has_units_from_id(self, conn: sqlite3.Connection, raid_id: int, discord_id: str) -> bool:
+        participant = conn.execute(
+            "SELECT bulls_hp, rhinos_hp, lieutenants_hp, generals_hp, mechas_hp, status FROM raid_participants WHERE raid_id = ? AND discord_id = ?",
+            (raid_id, str(discord_id)),
+        ).fetchone()
+        if participant is None:
+            return False
+        status = participant["status"] if "status" in participant.keys() else "ACTIVE"
+        if str(status or "ACTIVE") == "ELIMINATED":
+            return False
+        return (
+            int(participant["bulls_hp"] or 0)
+            + int(participant["rhinos_hp"] or 0)
+            + int(participant["lieutenants_hp"] or 0)
+            + int(participant["generals_hp"] or 0)
+            + int(participant["mechas_hp"] or 0)
             > 0
         )
 
@@ -430,7 +532,7 @@ class Store:
                 )
                 return None
 
-            current_id = raid["current_turn_discord_id"]
+            current_id = str(raid["current_turn_discord_id"]) if raid["current_turn_discord_id"] is not None else None
             current_index = turn_order.index(current_id) if current_id in turn_order else -1
             next_id = None
             next_index = None
@@ -468,28 +570,9 @@ class Store:
                     turn_index = ?, turn_round = ?, announcement_channel_id = ?, turn_reminder_state = 'NONE'
                 WHERE id = ?
                 """,
-                (next_id, now, deadline, next_index, round_number, str(channel_id) if channel_id is not None else None, raid_id),
+                (str(next_id), now, deadline, next_index, round_number, str(channel_id) if channel_id is not None else None, raid_id),
             )
             return self.get_participant(raid_id, next_id)
-
-    def _participant_has_units_from_id(self, conn: sqlite3.Connection, raid_id: int, discord_id: str) -> bool:
-        participant = conn.execute(
-            "SELECT bulls, rhinos, lieutenants, generals, mechas, status FROM raid_participants WHERE raid_id = ? AND discord_id = ?",
-            (raid_id, str(discord_id)),
-        ).fetchone()
-        if participant is None:
-            return False
-        status = participant["status"] if "status" in participant.keys() else "ACTIVE"
-        if str(status or "ACTIVE") == "ELIMINATED":
-            return False
-        return (
-            int(participant["bulls"])
-            + int(participant["rhinos"])
-            + int(participant["lieutenants"])
-            + int(participant["generals"])
-            + int(participant["mechas"])
-            > 0
-        )
 
     def process_turn_timeout(self, raid_id: int, channel_id: int | None = None) -> sqlite3.Row | None:
         raid = self.get_raid(raid_id)
@@ -510,62 +593,16 @@ class Store:
                 ).fetchone()
                 if participant is not None and self._participant_has_units_from_id(conn, raid_id, current_player_id):
                     current_units = Units.from_row(participant)
-                    loss = apply_damage_to_units(current_units, 5000)
-                    conn.execute(
-                        """
-                        UPDATE raid_participants SET
-                            bulls = ?, rhinos = ?, lieutenants = ?, generals = ?, mechas = ?,
-                            lost_bulls = lost_bulls + ?,
-                            lost_rhinos = lost_rhinos + ?,
-                            lost_lieutenants = lost_lieutenants + ?,
-                            lost_generals = lost_generals + ?,
-                            lost_mechas = lost_mechas + ?
-                        WHERE raid_id = ? AND discord_id = ?
-                        """,
-                        (
-                            loss.remaining.bulls,
-                            loss.remaining.rhinos,
-                            loss.remaining.lieutenants,
-                            loss.remaining.generals,
-                            loss.remaining.mechas,
-                            loss.destroyed.bulls,
-                            loss.destroyed.rhinos,
-                            loss.destroyed.lieutenants,
-                            loss.destroyed.generals,
-                            loss.destroyed.mechas,
-                            raid_id,
-                            str(current_player_id),
-                        ),
-                    )
-                    if not loss.remaining.has_any():
+                    current_health = combat_health_from_row(participant)
+                    remaining_units, destroyed_units, remaining_health, _ = apply_wounded_combat_damage(current_units, current_health, 5000)
+                    self.update_participant_units_and_losses(raid_id, current_player_id, remaining_units, destroyed_units, remaining_health)
+                    if not remaining_units.has_any():
                         conn.execute(
                             "UPDATE raid_participants SET status = ?, eliminated_at = ? WHERE raid_id = ? AND discord_id = ?",
                             ("ELIMINATED", utc_now(), raid_id, str(current_player_id)),
                         )
 
         return self.advance_turn(raid_id, channel_id)
-
-    def update_corruption(self, raid_id: int, current_corruption: int) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                "UPDATE raids SET current_corruption = ? WHERE id = ?",
-                (max(0, current_corruption), raid_id),
-            )
-    def update_arcadion_units(self, raid_id: int, units: Units) -> None:
-        with self.connect() as conn:
-            conn.execute(
-                """
-                UPDATE raids SET
-                    arcadion_bulls = ?,
-                    arcadion_rhinos = ?,
-                    arcadion_lieutenants = ?,
-                    arcadion_generals = ?,
-                    arcadion_mechas = ?
-                WHERE id = ?
-                """,
-                (units.bulls, units.rhinos, units.lieutenants, units.generals, units.mechas, raid_id),
-            )
-
     def upsert_participant(self, raid_id: int, discord_id: int, discord_name: str, units: Units) -> None:
         with self.connect() as conn:
             existing = conn.execute(
@@ -591,15 +628,22 @@ class Store:
             conn.execute(
                 """
                 INSERT INTO raid_participants
-                    (raid_id, discord_id, discord_name, bulls, rhinos, lieutenants, generals, mechas, joined_at, join_order, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (raid_id, discord_id, discord_name, bulls, rhinos, lieutenants, generals, mechas,
+                     bulls_hp, rhinos_hp, lieutenants_hp, generals_hp, mechas_hp,
+                     joined_at, join_order, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(raid_id, discord_id) DO UPDATE SET
                     discord_name = excluded.discord_name,
                     bulls = excluded.bulls,
                     rhinos = excluded.rhinos,
                     lieutenants = excluded.lieutenants,
                     generals = excluded.generals,
-                    mechas = excluded.mechas
+                    mechas = excluded.mechas,
+                    bulls_hp = excluded.bulls_hp,
+                    rhinos_hp = excluded.rhinos_hp,
+                    lieutenants_hp = excluded.lieutenants_hp,
+                    generals_hp = excluded.generals_hp,
+                    mechas_hp = excluded.mechas_hp
                 """,
                 (
                     raid_id,
@@ -610,6 +654,11 @@ class Store:
                     units.lieutenants,
                     units.generals,
                     units.mechas,
+                    units.bulls * COMBAT_UNIT_HEALTH["bulls"],
+                    units.rhinos * COMBAT_UNIT_HEALTH["rhinos"],
+                    units.lieutenants * COMBAT_UNIT_HEALTH["lieutenants"],
+                    units.generals * COMBAT_UNIT_HEALTH["generals"],
+                    units.mechas * COMBAT_UNIT_HEALTH["mechas"],
                     utc_now(),
                     join_order,
                     "ACTIVE",
@@ -675,31 +724,35 @@ class Store:
                     SELECT * FROM raid_participants
                     WHERE raid_id = ?
                       AND COALESCE(status, 'ACTIVE') != 'ELIMINATED'
-                      AND (bulls + rhinos + lieutenants + generals + mechas) > 0
+                      AND (COALESCE(bulls_hp, 0) + COALESCE(rhinos_hp, 0) + COALESCE(lieutenants_hp, 0) + COALESCE(generals_hp, 0) + COALESCE(mechas_hp, 0)) > 0
                     """,
                     (raid_id,),
                 )
             )
 
-    def update_participant_units_and_losses(self, raid_id: int, discord_id: int | str, remaining: Units, destroyed: Units) -> None:
+    def update_participant_units_and_losses(self, raid_id: int, discord_id: int | str, remaining: Units, destroyed: Units, remaining_health: dict[str, int] | None = None) -> None:
+        remaining_health = remaining_health or {name: getattr(remaining, name) * COMBAT_UNIT_HEALTH[name] for name in remaining.as_dict()}
         with self.connect() as conn:
             conn.execute(
                 """
                 UPDATE raid_participants SET
-                    bulls = ?, rhinos = ?, lieutenants = ?, generals = ?, mechas = ?,
-                    lost_bulls = lost_bulls + ?,
-                    lost_rhinos = lost_rhinos + ?,
-                    lost_lieutenants = lost_lieutenants + ?,
-                    lost_generals = lost_generals + ?,
-                    lost_mechas = lost_mechas + ?
+                    bulls = ?, bulls_hp = ?, rhinos = ?, rhinos_hp = ?, lieutenants = ?, lieutenants_hp = ?,
+                    generals = ?, generals_hp = ?, mechas = ?, mechas_hp = ?,
+                    lost_bulls = lost_bulls + ?, lost_rhinos = lost_rhinos + ?, lost_lieutenants = lost_lieutenants + ?,
+                    lost_generals = lost_generals + ?, lost_mechas = lost_mechas + ?
                 WHERE raid_id = ? AND discord_id = ?
                 """,
                 (
                     remaining.bulls,
+                    remaining_health["bulls"],
                     remaining.rhinos,
+                    remaining_health["rhinos"],
                     remaining.lieutenants,
+                    remaining_health["lieutenants"],
                     remaining.generals,
+                    remaining_health["generals"],
                     remaining.mechas,
+                    remaining_health["mechas"],
                     destroyed.bulls,
                     destroyed.rhinos,
                     destroyed.lieutenants,
@@ -780,28 +833,27 @@ class Store:
 
     def tick_turn_modifiers(self, raid_id: int, discord_id: int) -> None:
         with self.connect() as conn:
-            expiring = list(
-                conn.execute(
-                    """
-                    SELECT * FROM participant_modifiers
-                    WHERE raid_id = ? AND discord_id = ? AND remaining_turns = 1
-                    """,
-                    (raid_id, str(discord_id)),
-                )
-            )
-            for modifier in expiring:
-                if modifier["modifier_type"] == ModifierType.SOLDIER_ASCENDS.value and modifier["metadata"]:
-                    source_unit = modifier["metadata"]
-                    if source_unit in {"bulls", "rhinos"}:
-                        conn.execute(
-                            f"""
-                            UPDATE raid_participants
-                            SET lieutenants = MAX(0, lieutenants - 1),
-                                {source_unit} = {source_unit} + 1
-                            WHERE raid_id = ? AND discord_id = ? AND lieutenants > 0
-                            """,
-                            (raid_id, str(discord_id)),
-                        )
+            modifier_rows = conn.execute(
+                """
+                SELECT * FROM participant_modifiers
+                WHERE raid_id = ? AND discord_id = ? AND remaining_turns = 1
+                """,
+                (raid_id, str(discord_id)),
+            ).fetchall()
+            for row in modifier_rows:
+                if row["modifier_type"] == ModifierType.SOLDIER_ASCENDS.value and row["metadata"]:
+                    unit = row["metadata"]
+                    conn.execute(
+                        f"""
+                        UPDATE raid_participants
+                        SET {unit} = CASE WHEN {unit} > 0 THEN {unit} - 1 ELSE 0 END,
+                            {unit}_hp = CASE WHEN {unit}_hp > 0 THEN {unit}_hp - {COMBAT_UNIT_HEALTH[unit]} ELSE 0 END,
+                            lieutenants = lieutenants + 1,
+                            lieutenants_hp = lieutenants_hp + {COMBAT_UNIT_HEALTH['lieutenants']}
+                        WHERE raid_id = ? AND discord_id = ?
+                        """,
+                        (raid_id, str(discord_id)),
+                    )
             conn.execute(
                 """
                 UPDATE participant_modifiers
@@ -810,6 +862,7 @@ class Store:
                 """,
                 (raid_id, str(discord_id)),
             )
+
 
 
 def utc_now() -> str:
