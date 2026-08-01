@@ -1,7 +1,7 @@
-from __future__ import annotations
-            return
-        if not raid["turn_deadline_at"]:
-            return
+﻿from __future__ import annotations
+
+import asyncio
+import json
 import random
 from datetime import datetime, timedelta, timezone
 
@@ -150,7 +150,8 @@ class ArcadionBot(commands.Bot):
         raid = self.store.get_raid(raid_id)
         if raid is None or raid["state"] != RaidState.BATTLE.value:
             return
-        if str(raid["current_turn_discord_id"] or "") != str(discord_id):`r`n            return
+        if str(raid["current_turn_discord_id"] or "") != str(discord_id):
+            return
         if not raid["turn_deadline_at"]:
             return
         deadline = datetime.fromisoformat(raid["turn_deadline_at"])
@@ -511,8 +512,6 @@ def register_commands(bot: ArcadionBot) -> None:
         if raid is None or raid["state"] != RaidState.BATTLE.value:
             await interaction.response.send_message("There is no active battle.", ephemeral=True)
             return
-        if not interaction.response.is_done():
-            await interaction.response.defer(thinking=True)
         if raid_time_expired(raid):
             bot.store.finish_raid(raid["id"], "ARCADION")
             bot.clear_raid_leader(raid["id"])
@@ -526,40 +525,46 @@ def register_commands(bot: ArcadionBot) -> None:
 
         participant = bot.store.get_participant(raid["id"], interaction.user.id)
         if participant is None:
-            await interaction.followup.send("You are not participating in this raid.", ephemeral=True)
+            await interaction.response.send_message("You are not participating in this raid.", ephemeral=True)
             return
         if participant["status"] == "ELIMINATED":
-            await interaction.followup.send("? You have been eliminated from this raid.\n\nPlease wait until the next Arcadion Raid to fight again.", ephemeral=True)
+            await interaction.response.send_message("? You have been eliminated from this raid.\n\nPlease wait until the next Arcadion Raid to fight again.", ephemeral=True)
             return
 
         current_units = Units.from_row(participant)
         if not current_units.has_any():
-            await interaction.followup.send("You have no active troops left to attack.", ephemeral=True)
+            await interaction.response.send_message("You have no active troops left to attack.", ephemeral=True)
             return
 
         raid = bot.store.get_active_raid()
-        if raid is None or raid["state"] != RaidState.BATTLE.value:`r`n            await interaction.response.send_message("There is no active battle.", ephemeral=True)`r`n            return`r`n        if not interaction.response.is_done():`r`n            await interaction.response.defer(thinking=True)
+        if raid is None or raid["state"] != RaidState.BATTLE.value:
+            await interaction.response.send_message("There is no active battle.", ephemeral=True)
+            return
 
         if raid["current_turn_discord_id"] and str(raid["current_turn_discord_id"]) != str(interaction.user.id):
             current_holder = bot.store.get_participant(raid["id"], raid["current_turn_discord_id"])
             current_holder_name = current_holder["discord_name"] if current_holder else "the current player"
-            await interaction.followup.send(f"It's not your turn. The turn currently belongs to @{current_holder_name}", ephemeral=True)
+            await interaction.response.send_message(f"It's not your turn. The turn currently belongs to @{current_holder_name}", ephemeral=True)
             return
 
         if not raid["current_turn_discord_id"]:
             bot.store.advance_turn(raid["id"], interaction.channel_id)
             raid = bot.store.get_active_raid()
 
-        if raid is None or raid["state"] != RaidState.BATTLE.value:`r`n            await interaction.response.send_message("There is no active battle.", ephemeral=True)`r`n            return`r`n        if not interaction.response.is_done():`r`n            await interaction.response.defer(thinking=True)
+        if raid is None or raid["state"] != RaidState.BATTLE.value:
+            await interaction.response.send_message("There is no active battle.", ephemeral=True)
+            return
 
         if raid["current_turn_discord_id"] and str(raid["current_turn_discord_id"]) != str(interaction.user.id):
             current_holder = bot.store.get_participant(raid["id"], raid["current_turn_discord_id"])
             current_holder_name = current_holder["discord_name"] if current_holder else "the current player"
-            await interaction.followup.send(f"It's not your turn. The turn currently belongs to @{current_holder_name}", ephemeral=True)
+            await interaction.response.send_message(f"It's not your turn. The turn currently belongs to @{current_holder_name}", ephemeral=True)
             return
 
         if raid["turn_deadline_at"] and datetime.fromisoformat(raid["turn_deadline_at"]) <= datetime.now(timezone.utc):
             current_player = bot.store.get_participant(raid["id"], raid["current_turn_discord_id"])
+        if not interaction.response.is_done():
+            await interaction.response.defer(thinking=True)
         bot.cancel_turn_timeout(raid["id"])
         dice_count = attack_dice_count(bot.store, raid["id"], interaction.user.id)
         attacker_roll = roll_dice(dice_count)
@@ -681,7 +686,7 @@ def register_commands(bot: ArcadionBot) -> None:
             return
         participant = bot.store.get_participant(raid["id"], interaction.user.id)
         if participant is None:
-            await interaction.followup.send("You are not participating in this raid.", ephemeral=True)
+            await interaction.response.send_message("You are not participating in this raid.", ephemeral=True)
             return
         if participant["status"] == "ELIMINATED":
             await interaction.response.send_message("? You have been eliminated from this raid and cannot use modifiers.", ephemeral=True)
@@ -720,7 +725,9 @@ def register_commands(bot: ArcadionBot) -> None:
     )
     async def modifier_apply(interaction: discord.Interaction, user: discord.Member, modifier: app_commands.Choice[str]) -> None:
         raid = bot.store.get_active_raid()
-        if raid is None or raid["state"] != RaidState.BATTLE.value:`r`n            await interaction.response.send_message("There is no active battle.", ephemeral=True)`r`n            return`r`n        if not interaction.response.is_done():`r`n            await interaction.response.defer(thinking=True)
+        if raid is None or raid["state"] != RaidState.BATTLE.value:
+            await interaction.response.send_message("There is no active battle.", ephemeral=True)
+            return
         if bot.get_raid_leader(raid["id"]) != interaction.user.id:
             await interaction.response.send_message("Only the raid leader can use this command.", ephemeral=True)
             return
@@ -736,7 +743,9 @@ def register_commands(bot: ArcadionBot) -> None:
     @app_commands.checks.has_permissions(manage_guild=True)
     async def raid_kick(interaction: discord.Interaction, user: discord.Member) -> None:
         raid = bot.store.get_active_raid()
-        if raid is None or raid["state"] != RaidState.BATTLE.value:`r`n            await interaction.response.send_message("There is no active battle.", ephemeral=True)`r`n            return`r`n        if not interaction.response.is_done():`r`n            await interaction.response.defer(thinking=True)
+        if raid is None or raid["state"] != RaidState.BATTLE.value:
+            await interaction.response.send_message("There is no active battle.", ephemeral=True)
+            return
         if bot.get_raid_leader(raid["id"]) != interaction.user.id:
             await interaction.response.send_message("Only the raid leader can use this command.", ephemeral=True)
             return
@@ -797,7 +806,9 @@ def register_commands(bot: ArcadionBot) -> None:
     @app_commands.checks.has_permissions(manage_guild=True)
     async def raid_skip_turn(interaction: discord.Interaction) -> None:
         raid = bot.store.get_active_raid()
-        if raid is None or raid["state"] != RaidState.BATTLE.value:`r`n            await interaction.response.send_message("There is no active battle.", ephemeral=True)`r`n            return`r`n        if not interaction.response.is_done():`r`n            await interaction.response.defer(thinking=True)
+        if raid is None or raid["state"] != RaidState.BATTLE.value:
+            await interaction.response.send_message("There is no active battle.", ephemeral=True)
+            return
         if bot.get_raid_leader(raid["id"]) != interaction.user.id:
             await interaction.response.send_message("Only the raid leader can use this command.", ephemeral=True)
             return
@@ -1104,7 +1115,5 @@ def main() -> None:
     store = Store(settings.database_path)
     bot = ArcadionBot(store, settings.guild_id)
     bot.run(settings.discord_token)
-
-
 
 
