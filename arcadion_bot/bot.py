@@ -563,6 +563,8 @@ def register_commands(bot: ArcadionBot) -> None:
 
         if raid["turn_deadline_at"] and datetime.fromisoformat(raid["turn_deadline_at"]) <= datetime.now(timezone.utc):
             current_player = bot.store.get_participant(raid["id"], raid["current_turn_discord_id"])
+        if not interaction.response.is_done():
+            await interaction.response.defer(thinking=True)
         bot.cancel_turn_timeout(raid["id"])
         dice_count = attack_dice_count(bot.store, raid["id"], interaction.user.id)
         attacker_roll = roll_dice(dice_count)
@@ -649,7 +651,7 @@ def register_commands(bot: ArcadionBot) -> None:
             await interaction.channel.send(f"{threat_line}\n\n{counterattack_message}")
 
         if result_message is None:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 embed=attack_embed(
                     attacker_name=interaction.user.display_name,
                     attacker_roll=attacker_roll,
@@ -666,8 +668,6 @@ def register_commands(bot: ArcadionBot) -> None:
             return
 
         completed_raid = bot.store.get_raid(raid["id"])
-        if not interaction.response.is_done():
-            await interaction.response.defer()
         await interaction.followup.send(
             embed=loot_summary_embed(completed_raid, bot.store.list_participants(raid["id"]), result_message)
         )
@@ -1115,3 +1115,5 @@ def main() -> None:
     store = Store(settings.database_path)
     bot = ArcadionBot(store, settings.guild_id)
     bot.run(settings.discord_token)
+
+
