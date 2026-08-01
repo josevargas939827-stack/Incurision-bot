@@ -957,6 +957,54 @@ def raid_created_embed(raid: object) -> discord.Embed:
     return embed
 
 
+def status_embed(raid: object, participants: list[object]) -> discord.Embed:
+    active_participants = [participant for participant in participants if int(participant["bulls_hp"] or 0) + int(participant["rhinos_hp"] or 0) + int(participant["lieutenants_hp"] or 0) + int(participant["generals_hp"] or 0) + int(participant["mechas_hp"] or 0) > 0 and str(participant["status"] or "ACTIVE") != "ELIMINATED"]
+    total_damage = sum(int(participant["damage_done"] or 0) for participant in participants)
+    total_attacks = sum(int(participant["attacks"] or 0) for participant in participants)
+    participant_count = len(active_participants)
+    raid_power = sum(
+        int(participant["bulls_hp"] or 0)
+        + int(participant["rhinos_hp"] or 0)
+        + int(participant["lieutenants_hp"] or 0)
+        + int(participant["generals_hp"] or 0)
+        + int(participant["mechas_hp"] or 0)
+        for participant in active_participants
+    )
+    corruption_current = int(raid["current_corruption"] or 0)
+    corruption_max = max(1, int(raid["max_corruption"] or 1))
+    percent_complete = round((1 - (corruption_current / corruption_max)) * 100)
+
+    embed = discord.Embed(title=f"?? RAID STATUS: {raid['name']}", color=0x1F8B4C if raid["state"] == RaidState.RECRUITING.value else 0xB22222)
+    embed.add_field(name="City", value=raid["city"], inline=True)
+    embed.add_field(name="Level", value=raid["level"], inline=True)
+    embed.add_field(name="State", value=raid["state"], inline=True)
+    embed.add_field(name="Corruption", value=f"{format_number(corruption_current)} / {format_number(int(raid['max_corruption']))}", inline=False)
+    embed.add_field(name="Completion", value=f"{percent_complete}%", inline=True)
+    embed.add_field(name="Participants", value=str(participant_count), inline=True)
+    embed.add_field(name="Remaining Military Power", value=format_number(raid_power), inline=True)
+    embed.add_field(name="Total Damage Dealt", value=format_number(total_damage), inline=True)
+    embed.add_field(name="Total Attacks", value=str(total_attacks), inline=True)
+    embed.add_field(name="Loot Upx", value=format_number(int(raid['total_loot_upx'] or 0)), inline=True)
+    embed.add_field(name="Power Limit", value=format_number(int(raid['power_limit'] or 0)) if int(raid['power_limit'] or 0) > 0 else "No limit", inline=True)
+
+    if raid["state"] == RaidState.BATTLE.value and raid["current_turn_discord_id"]:
+        current_player = next((participant for participant in participants if str(participant["discord_id"]) == str(raid["current_turn_discord_id"])), None)
+        if current_player is not None:
+            embed.add_field(name="Current Turn", value=f"<@{current_player['discord_id']}>", inline=False)
+            embed.add_field(name="Turn Military Power", value=format_number(sum(int(current_player[field]) or 0 for field in ("bulls_hp", "rhinos_hp", "lieutenants_hp", "generals_hp", "mechas_hp"))), inline=False)
+            embed.add_field(name="Turn Deadline", value=raid["turn_deadline_at"] or "Unknown", inline=False)
+
+    if participants:
+        ordered = sorted(participants, key=lambda participant: (-int(participant["damage_done"] or 0), -int(participant["attacks"] or 0), str(participant["discord_name"])))
+        lines = []
+        for index, participant in enumerate(ordered[:10], start=1):
+            remaining_power = int(participant["bulls_hp"] or 0) + int(participant["rhinos_hp"] or 0) + int(participant["lieutenants_hp"] or 0) + int(participant["generals_hp"] or 0) + int(participant["mechas_hp"] or 0)
+            lines.append(f"{index}. {participant['discord_name']} - {format_number(remaining_power)} HP - {format_number(int(participant['damage_done'] or 0))} dmg")
+        embed.add_field(name="Top Commanders", value="\n".join(lines), inline=False)
+
+    return embed
+
+
 def joined_embed(name: str, units: Units) -> discord.Embed:
     embed = discord.Embed(title=f"??? {name} joins the raid", color=0x2E8B57)
     embed.add_field(name="Troops Sent", value=format_units(units), inline=False)
