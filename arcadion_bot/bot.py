@@ -516,7 +516,9 @@ def register_commands(bot: ArcadionBot) -> None:
             bot.store.finish_raid(raid["id"], "ARCADION")
             bot.clear_raid_leader(raid["id"])
             finished_raid = bot.store.get_raid(raid["id"])
-            await interaction.response.send_message(
+            if not interaction.response.is_done():
+                await interaction.response.defer()
+            await interaction.followup.send(
                 embed=loot_summary_embed(finished_raid, bot.store.list_participants(raid["id"]), "Arcadion wins. The raid timer has expired.")
             )
             return
@@ -664,7 +666,9 @@ def register_commands(bot: ArcadionBot) -> None:
             return
 
         completed_raid = bot.store.get_raid(raid["id"])
-        await interaction.response.send_message(
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+        await interaction.followup.send(
             embed=loot_summary_embed(completed_raid, bot.store.list_participants(raid["id"]), result_message)
         )
 
@@ -838,7 +842,9 @@ def register_commands(bot: ArcadionBot) -> None:
         bot.store.finish_raid(raid["id"], "MANUAL")
         bot.clear_raid_leader(raid["id"])
         finished_raid = bot.store.get_raid(raid["id"])
-        await interaction.response.send_message(embed=loot_summary_embed(finished_raid, bot.store.list_participants(raid["id"]), "The raid was manually finished."))
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+        await interaction.followup.send(embed=loot_summary_embed(finished_raid, bot.store.list_participants(raid["id"]), "The raid was manually finished."))
 
 
 def attack_dice_count(store: Store, raid_id: int, discord_id: int) -> int:
@@ -1001,6 +1007,35 @@ def status_embed(raid: object, participants: list[object]) -> discord.Embed:
             remaining_power = int(participant["bulls_hp"] or 0) + int(participant["rhinos_hp"] or 0) + int(participant["lieutenants_hp"] or 0) + int(participant["generals_hp"] or 0) + int(participant["mechas_hp"] or 0)
             lines.append(f"{index}. {participant['discord_name']} - {format_number(remaining_power)} HP - {format_number(int(participant['damage_done'] or 0))} dmg")
         embed.add_field(name="Top Commanders", value="\n".join(lines), inline=False)
+
+    return embed
+
+
+def loot_summary_embed(raid: object, participants: list[object], result_message: str) -> discord.Embed:
+    total_loot = max(0, int(raid["total_loot_upx"] or 0))
+    contributions = [(participant["discord_name"], int(participant["damage_done"] or 0)) for participant in participants]
+    distribution = calculate_loot_distribution(total_loot, contributions)
+
+    embed = discord.Embed(title=f"?? RAID COMPLETE: {raid['name']}", color=0x1F8B4C if str(raid['result'] or '').upper() in ('PLAYERS', 'SUCCESS') else 0x8B0000)
+    embed.add_field(name="Result", value=result_message, inline=False)
+    embed.add_field(name="City", value=raid["city"], inline=True)
+    embed.add_field(name="Level", value=raid["level"], inline=True)
+    embed.add_field(name="Final Corruption", value=f"{format_number(int(raid['current_corruption'] or 0))} / {format_number(int(raid['max_corruption'] or 0))}", inline=False)
+    embed.add_field(name="Total Loot UPX", value=format_number(total_loot), inline=True)
+    embed.add_field(name="Participants", value=str(len(participants)), inline=True)
+
+    if distribution:
+        lines = []
+        for entry in distribution:
+            lines.append(f"{entry['player']} - {entry['participation_percent']} - {format_number(int(entry['damage']))} damage - {format_number(int(entry['reward']))} UPX")
+        embed.add_field(name="Loot Distribution", value="\n".join(lines[:10]), inline=False)
+
+    if participants:
+        ordered = sorted(participants, key=lambda participant: (-int(participant["damage_done"] or 0), -int(participant["attacks"] or 0), str(participant["discord_name"])))
+        lines = []
+        for index, participant in enumerate(ordered[:10], start=1):
+            lines.append(f"{index}. {participant['discord_name']} - {format_number(int(participant['damage_done'] or 0))} damage - {format_number(int(participant['attacks'] or 0))} attacks")
+        embed.add_field(name="Top Damage", value="\n".join(lines), inline=False)
 
     return embed
 
