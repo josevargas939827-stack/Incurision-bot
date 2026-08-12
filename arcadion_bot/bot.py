@@ -57,15 +57,26 @@ class ArcadionBot(commands.Bot):
     async def setup_hook(self) -> None:
         self.store.init()
         register_commands(self)
+        print(f'GUILD_ID: {self.guild_id}')
+        print(f'Registered commands: {len(self.tree.get_commands())}')
         self.loop.create_task(self.manage_turn_notifications())
         if self.guild_id:
+            print('Entering guild sync block: yes')
             guild = discord.Object(id=self.guild_id)
+            print(f'Syncing commands to guild: {guild.id}')
             self.tree.copy_global_to(guild=guild)
-            await self.tree.sync(guild=guild)
+            guild_commands = await self.tree.sync(guild=guild)
+            print(f'Guild commands synced: {len(guild_commands)}')
+            print('Clearing global commands: before')
             self.tree.clear_commands(guild=None)
-            await self.tree.sync()
+            print('Clearing global commands: after')
+            global_commands = await self.tree.sync()
+            print(f'Global commands synced: {len(global_commands)}')
+            print('Guild sync completed')
         else:
-            await self.tree.sync()
+            print('Entering guild sync block: no')
+            global_commands = await self.tree.sync()
+            print(f'Global commands synced: {len(global_commands)}')
 
     async def manage_turn_notifications(self) -> None:
         while True:
@@ -1007,6 +1018,42 @@ def status_embed(raid: object, participants: list[object]) -> discord.Embed:
         embed.add_field(name="Top Commanders", value="\n".join(lines), inline=False)
 
     return embed
+
+
+def counterattack_summary(target_name: str, damage: int, destroyed: Units, remaining: Units, arcadion_dice: str | None = None) -> str:
+    lines = [
+        "?? Arcadion Counterattack!",
+        "",
+        "Damage Dealt:",
+        f"{format_number(damage)}",
+    ]
+    if arcadion_dice:
+        lines.extend(["", f"Dice: {arcadion_dice}"])
+    lines.extend(["", "Units Destroyed"])
+
+    destroyed_any = False
+    for field in ("bulls", "rhinos", "lieutenants", "generals", "mechas"):
+        amount = getattr(destroyed, field)
+        if amount > 0:
+            destroyed_any = True
+            label = UNIT_LABELS[field]
+            lines.append(f"-{amount} {label}{'' if amount == 1 else 's'}")
+
+    if not destroyed_any:
+        lines.append("-No units destroyed")
+
+    lines.extend(["", "Remaining Army"])
+    for field in ("bulls", "rhinos", "lieutenants", "generals", "mechas"):
+        amount = getattr(remaining, field)
+        if amount > 0:
+            label = UNIT_LABELS[field]
+            lines.append(f"{label}: {amount}")
+
+    if not any(getattr(remaining, field) > 0 for field in ("bulls", "rhinos", "lieutenants", "generals", "mechas")):
+        lines.append("All units destroyed")
+
+    lines.extend(["", "Remaining Military Power", f"{format_number(remaining.power())}"])
+    return "\n".join(lines)
 
 
 def loot_summary_embed(raid: object, participants: list[object], result_message: str) -> discord.Embed:
