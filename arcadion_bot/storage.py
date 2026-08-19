@@ -53,6 +53,7 @@ class Store:
                     name TEXT NOT NULL,
                     city TEXT NOT NULL,
                     level TEXT NOT NULL,
+                    raid_admin_discord_id TEXT,
                     max_corruption INTEGER NOT NULL,
                     current_corruption INTEGER NOT NULL,
                     arcadion_bulls INTEGER NOT NULL DEFAULT 0,
@@ -108,6 +109,7 @@ class Store:
                     turns_played INTEGER NOT NULL DEFAULT 0,
                     joined_at TEXT NOT NULL,
                     join_order INTEGER,
+                    loaded_variants TEXT NOT NULL DEFAULT '{}',
                     status TEXT NOT NULL DEFAULT 'ACTIVE',
                     eliminated_at TEXT,
                     PRIMARY KEY (raid_id, discord_id),
@@ -119,10 +121,19 @@ class Store:
                     raid_id INTEGER NOT NULL,
                     attacker_id TEXT NOT NULL,
                     attacker_rolls TEXT NOT NULL,
+                    attacker_dice_count INTEGER NOT NULL DEFAULT 0,
+                    attacker_successes INTEGER NOT NULL DEFAULT 0,
                     attacker_damage INTEGER NOT NULL,
                     arcadion_rolls TEXT NOT NULL,
+                    arcadion_dice_count INTEGER NOT NULL DEFAULT 0,
+                    arcadion_successes INTEGER NOT NULL DEFAULT 0,
                     arcadion_damage INTEGER NOT NULL,
                     target_id TEXT,
+                    dice_clash_winner TEXT,
+                    mecha_variant TEXT,
+                    mecha_ability TEXT,
+                    mecha_bonus_activated INTEGER NOT NULL DEFAULT 0,
+                    mecha_bonus_damage INTEGER NOT NULL DEFAULT 0,
                     destroyed_units TEXT NOT NULL,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY (raid_id) REFERENCES raids(id)
@@ -155,6 +166,7 @@ class Store:
                 ("arcadion_mechas_hp", "INTEGER NOT NULL DEFAULT 0"),
                 ("total_loot_upx", "INTEGER NOT NULL DEFAULT 0"),
                 ("power_limit", "INTEGER NOT NULL DEFAULT 0"),
+                ("raid_admin_discord_id", "TEXT"),
                 ("turn_order", "TEXT"),
                 ("current_turn_discord_id", "TEXT"),
                 ("turn_started_at", "TEXT"),
@@ -173,6 +185,7 @@ class Store:
                 ("turns_played", "INTEGER NOT NULL DEFAULT 0"),
                 ("status", "TEXT NOT NULL DEFAULT 'ACTIVE'"),
                 ("eliminated_at", "TEXT"),
+                ("loaded_variants", "TEXT NOT NULL DEFAULT '{}'"),
                 ("bulls_hp", "INTEGER NOT NULL DEFAULT 0"),
                 ("rhinos_hp", "INTEGER NOT NULL DEFAULT 0"),
                 ("lieutenants_hp", "INTEGER NOT NULL DEFAULT 0"),
@@ -181,6 +194,52 @@ class Store:
             ):
                 if column not in participant_columns:
                     conn.execute(f"ALTER TABLE raid_participants ADD COLUMN {column} {definition}")
+
+            variant_columns = {row["name"] for row in conn.execute("PRAGMA table_info(player_unit_variants)")}
+            if not variant_columns:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS player_unit_variants (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        discord_id TEXT NOT NULL,
+                        unit_variant TEXT NOT NULL,
+                        quantity INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT NOT NULL,
+                        UNIQUE(discord_id, unit_variant)
+                    )
+                    """
+                )
+            else:
+                for column, definition in (
+                    ("discord_id", "TEXT NOT NULL DEFAULT ''"),
+                    ("unit_variant", "TEXT NOT NULL DEFAULT ''"),
+                    ("quantity", "INTEGER NOT NULL DEFAULT 0"),
+                    ("updated_at", "TEXT NOT NULL DEFAULT ''"),
+                ):
+                    if column not in variant_columns:
+                        conn.execute(f"ALTER TABLE player_unit_variants ADD COLUMN {column} {definition}")
+
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_player_unit_variants_discord_variant
+                ON player_unit_variants (discord_id, unit_variant)
+                """
+            )
+
+            attack_log_columns = {row["name"] for row in conn.execute("PRAGMA table_info(attack_log)")}
+            for column, definition in (
+                ("attacker_dice_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("attacker_successes", "INTEGER NOT NULL DEFAULT 0"),
+                ("arcadion_dice_count", "INTEGER NOT NULL DEFAULT 0"),
+                ("arcadion_successes", "INTEGER NOT NULL DEFAULT 0"),
+                ("dice_clash_winner", "TEXT"),
+                ("mecha_variant", "TEXT"),
+                ("mecha_ability", "TEXT"),
+                ("mecha_bonus_activated", "INTEGER NOT NULL DEFAULT 0"),
+                ("mecha_bonus_damage", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if column not in attack_log_columns:
+                    conn.execute(f"ALTER TABLE attack_log ADD COLUMN {column} {definition}")
 
             conn.executescript(
                 """
@@ -292,11 +351,124 @@ class Store:
             )
             return True
 
+    def list_player_unit_variants(self, discord_id: int | str) -> list[sqlite3.Row]:
+        with self.connect() as conn:
+            return list(
+                conn.execute(
+                    """
+                    SELECT * FROM player_unit_variants
+                    WHERE discord_id = ?
+                    ORDER BY unit_variant ASC, id ASC
+                    """,
+                    (str(discord_id),),
+                )
+            )
+
+    def get_player_unit_variants(self, discord_id: int | str) -> dict[str, int]:
+        variants: dict[str, int] = {}
+        for row in self.list_player_unit_variants(discord_id):
+            variants[str(row["unit_variant"])] = int(row["quantity"] or 0)
+        return variants
+
+    def set_player_unit_variants(self, discord_id: int | str, variants: dict[str, int]) -> None:
+        now = utc_now()
+        with self.connect() as conn:
+            conn.execute("DELETE FROM player_unit_variants WHERE discord_id = ?", (str(discord_id),))
+            for unit_variant, quantity in variants.items():
+                conn.execute(
+                    """
+                    INSERT INTO player_unit_variants (discord_id, unit_variant, quantity, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (str(discord_id), unit_variant, max(0, int(quantity)), now),
+                )
+
+    def get_participant_loaded_variants(self, raid_id: int, discord_id: int | str) -> dict[str, int]:
+        with self.connect() as conn:
+            row = conn.execute(
+                "SELECT loaded_variants FROM raid_participants WHERE raid_id = ? AND discord_id = ?",
+                (raid_id, str(discord_id)),
+            ).fetchone()
+            if row is None or not row["loaded_variants"]:
+                return {}
+            try:
+                raw = json.loads(row["loaded_variants"])
+            except json.JSONDecodeError:
+                return {}
+            if not isinstance(raw, dict):
+                return {}
+            return {str(key): max(0, int(value)) for key, value in raw.items()}
+
+    def set_participant_loaded_variants(self, raid_id: int, discord_id: int | str, variants: dict[str, int]) -> None:
+        with self.connect() as conn:
+            conn.execute(
+                """
+                UPDATE raid_participants
+                SET loaded_variants = ?
+                WHERE raid_id = ? AND discord_id = ?
+                """,
+                (json.dumps({str(key): max(0, int(value)) for key, value in variants.items()}), raid_id, str(discord_id)),
+            )
+
+    def count_mecha_bonus_activations(self, raid_id: int, discord_id: int | str, unit_variant: str, ability_name: str) -> int:
+        with self.connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS count
+                FROM attack_log
+                WHERE raid_id = ? AND attacker_id = ? AND mecha_variant = ? AND mecha_ability = ? AND mecha_bonus_activated = 1
+                """,
+                (raid_id, str(discord_id), unit_variant, ability_name),
+            ).fetchone()
+            return int(row["count"] if row is not None else 0)
+
+    def heal_participant_units(self, raid_id: int, discord_id: int | str, healing_points: int) -> None:
+        healing_points = max(0, int(healing_points))
+        if healing_points <= 0:
+            return
+        with self.connect() as conn:
+            participant = conn.execute(
+                "SELECT * FROM raid_participants WHERE raid_id = ? AND discord_id = ?",
+                (raid_id, str(discord_id)),
+            ).fetchone()
+            if participant is None:
+                return
+            current_counts = Units.from_row(participant)
+            current_health = combat_health_from_row(participant)
+            max_health = {name: getattr(current_counts, name) * COMBAT_UNIT_HEALTH[name] for name in current_counts.as_dict()}
+            remaining_heal = healing_points
+            for name in ("bulls", "rhinos", "lieutenants", "generals", "mechas"):
+                if remaining_heal <= 0:
+                    break
+                cap = max_health[name] - current_health[name]
+                if cap <= 0:
+                    continue
+                gained = min(cap, remaining_heal)
+                current_health[name] += gained
+                remaining_heal -= gained
+            conn.execute(
+                """
+                UPDATE raid_participants
+                SET bulls_hp = ?, rhinos_hp = ?, lieutenants_hp = ?, generals_hp = ?, mechas_hp = ?
+                WHERE raid_id = ? AND discord_id = ?
+                """,
+                (
+                    current_health["bulls"],
+                    current_health["rhinos"],
+                    current_health["lieutenants"],
+                    current_health["generals"],
+                    current_health["mechas"],
+                    raid_id,
+                    str(discord_id),
+                ),
+            )
+
     def create_raid(
         self,
         name: str,
         city: str,
         level: str,
+        raid_admin_discord_id: int | str | None,
         max_corruption: int,
         duration_hours: int,
         arcadion_units: Units | None = None,
@@ -309,17 +481,18 @@ class Store:
             cursor = conn.execute(
                 """
                 INSERT INTO raids (
-                    name, city, level, max_corruption, current_corruption,
+                    name, city, level, raid_admin_discord_id, max_corruption, current_corruption,
                     arcadion_bulls, arcadion_rhinos, arcadion_lieutenants, arcadion_generals, arcadion_mechas,
                     arcadion_bulls_hp, arcadion_rhinos_hp, arcadion_lieutenants_hp, arcadion_generals_hp, arcadion_mechas_hp,
                     duration_hours, state, created_at, total_loot_upx, power_limit
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     name,
                     city,
                     level,
+                    str(raid_admin_discord_id) if raid_admin_discord_id is not None else None,
                     max_corruption,
                     max_corruption,
                     arcadion_units.bulls,
@@ -455,7 +628,7 @@ class Store:
             return
 
         now = utc_now()
-        deadline = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+        deadline = (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat()
         conn.execute(
             """
             UPDATE raids
@@ -562,7 +735,7 @@ class Store:
                 round_number += 1
 
             now = utc_now()
-            deadline = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+            deadline = (datetime.now(timezone.utc) + timedelta(seconds=120)).isoformat()
             conn.execute(
                 """
                 UPDATE raids
@@ -630,8 +803,8 @@ class Store:
                 INSERT INTO raid_participants
                     (raid_id, discord_id, discord_name, bulls, rhinos, lieutenants, generals, mechas,
                      bulls_hp, rhinos_hp, lieutenants_hp, generals_hp, mechas_hp,
-                     joined_at, join_order, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     joined_at, join_order, loaded_variants, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(raid_id, discord_id) DO UPDATE SET
                     discord_name = excluded.discord_name,
                     bulls = excluded.bulls,
@@ -643,7 +816,8 @@ class Store:
                     rhinos_hp = excluded.rhinos_hp,
                     lieutenants_hp = excluded.lieutenants_hp,
                     generals_hp = excluded.generals_hp,
-                    mechas_hp = excluded.mechas_hp
+                    mechas_hp = excluded.mechas_hp,
+                    loaded_variants = excluded.loaded_variants
                 """,
                 (
                     raid_id,
@@ -661,6 +835,7 @@ class Store:
                     units.mechas * COMBAT_UNIT_HEALTH["mechas"],
                     utc_now(),
                     join_order,
+                    "{}",
                     "ACTIVE",
                 ),
             )
@@ -779,28 +954,48 @@ class Store:
         raid_id: int,
         attacker_id: int,
         attacker_rolls: str,
+        attacker_dice_count: int,
+        attacker_successes: int,
         attacker_damage: int,
         arcadion_rolls: str,
+        arcadion_dice_count: int,
+        arcadion_successes: int,
         arcadion_damage: int,
         target_id: str | None,
+        dice_clash_winner: str | None,
+        mecha_variant: str | None,
+        mecha_ability: str | None,
+        mecha_bonus_activated: bool,
+        mecha_bonus_damage: int,
         destroyed_units: str,
     ) -> None:
         with self.connect() as conn:
             conn.execute(
                 """
                 INSERT INTO attack_log
-                    (raid_id, attacker_id, attacker_rolls, attacker_damage, arcadion_rolls,
-                     arcadion_damage, target_id, destroyed_units, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (raid_id, attacker_id, attacker_rolls, attacker_dice_count, attacker_successes,
+                     attacker_damage, arcadion_rolls, arcadion_dice_count, arcadion_successes,
+                     arcadion_damage, target_id, dice_clash_winner, mecha_variant, mecha_ability,
+                     mecha_bonus_activated, mecha_bonus_damage, destroyed_units, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     raid_id,
                     str(attacker_id),
                     attacker_rolls,
+                    attacker_dice_count,
+                    attacker_successes,
                     attacker_damage,
                     arcadion_rolls,
+                    arcadion_dice_count,
+                    arcadion_successes,
                     arcadion_damage,
                     target_id,
+                    dice_clash_winner,
+                    mecha_variant,
+                    mecha_ability,
+                    1 if mecha_bonus_activated else 0,
+                    mecha_bonus_damage,
                     destroyed_units,
                     utc_now(),
                 ),
