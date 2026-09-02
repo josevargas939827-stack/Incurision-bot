@@ -121,6 +121,7 @@ ARMY_VARIANT_ORDER = (
 class ArcadionBot(commands.Bot):
     def __init__(self, store: Store, guild_id: int | None) -> None:
         intents = discord.Intents.default()
+        intents.members = True
         super().__init__(command_prefix="!", intents=intents)
         self.store = store
         self.guild_id = guild_id
@@ -139,14 +140,20 @@ class ArcadionBot(commands.Bot):
             guild = discord.Object(id=self.guild_id)
             print(f'Syncing commands to guild: {guild.id}')
             self.tree.copy_global_to(guild=guild)
-            guild_commands = await self.tree.sync(guild=guild)
-            print(f'Guild commands synced: {len(guild_commands)}')
-            print('Clearing global commands: before')
-            self.tree.clear_commands(guild=None)
-            print('Clearing global commands: after')
-            global_commands = await self.tree.sync()
-            print(f'Global commands synced: {len(global_commands)}')
-            print('Guild sync completed')
+            try:
+                guild_commands = await self.tree.sync(guild=guild)
+                print(f'Guild commands synced: {len(guild_commands)}')
+            except discord.Forbidden as exc:
+                print(f'Guild command sync failed: 403 Forbidden / Missing Access: {exc}')
+                print('Bot startup will continue despite guild sync failure.')
+            except discord.HTTPException as exc:
+                print(f'Guild command sync failed: HTTP {exc.status}: {exc}')
+                print('Bot startup will continue despite guild sync failure.')
+            try:
+                global_commands = await self.tree.sync()
+                print(f'Global commands synced: {len(global_commands)}')
+            except discord.HTTPException as exc:
+                print(f'Global command sync failed: HTTP {exc.status}: {exc}')
         else:
             print('Entering guild sync block: no')
             global_commands = await self.tree.sync()
