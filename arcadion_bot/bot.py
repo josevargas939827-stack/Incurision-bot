@@ -135,29 +135,15 @@ class ArcadionBot(commands.Bot):
         print(f'GUILD_ID: {self.guild_id}')
         print(f'Registered commands: {len(self.tree.get_commands())}')
         self.loop.create_task(self.manage_turn_notifications())
-        if self.guild_id:
-            print('Entering guild sync block: yes')
-            guild = discord.Object(id=self.guild_id)
-            print(f'Syncing commands to guild: {guild.id}')
-            self.tree.copy_global_to(guild=guild)
-            try:
-                guild_commands = await self.tree.sync(guild=guild)
-                print(f'Guild commands synced: {len(guild_commands)}')
-            except discord.Forbidden as exc:
-                print(f'Guild command sync failed: 403 Forbidden / Missing Access: {exc}')
-                print('Bot startup will continue despite guild sync failure.')
-            except discord.HTTPException as exc:
-                print(f'Guild command sync failed: HTTP {exc.status}: {exc}')
-                print('Bot startup will continue despite guild sync failure.')
-            try:
-                global_commands = await self.tree.sync()
-                print(f'Global commands synced: {len(global_commands)}')
-            except discord.HTTPException as exc:
-                print(f'Global command sync failed: HTTP {exc.status}: {exc}')
-        else:
-            print('Entering guild sync block: no')
+        try:
             global_commands = await self.tree.sync()
             print(f'Global commands synced: {len(global_commands)}')
+        except discord.Forbidden as exc:
+            print(f'Global command sync failed: 403 Forbidden / Missing Access: {exc}')
+            print('Bot startup will continue despite global sync failure.')
+        except discord.HTTPException as exc:
+            print(f'Global command sync failed: HTTP {exc.status}: {exc}')
+            print('Bot startup will continue despite global sync failure.')
 
     async def manage_turn_notifications(self) -> None:
         while True:
