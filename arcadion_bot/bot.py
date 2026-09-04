@@ -369,6 +369,26 @@ def units_from_args(bulls: int | str, rhinos: int | str, lieutenants: int | str,
     return Units(bulls=values[0], rhinos=values[1], lieutenants=values[2], generals=values[3], mechas=values[4])
 
 
+def arcadion_target_power(level: object) -> int | None:
+    normalized = str(level or "").strip().lower()
+    targets = {
+        "1": 450000,
+        "minor": 450000,
+        "arcadion minor": 450000,
+        "menor": 450000,
+        "arcadion menor": 450000,
+        "2": 700000,
+        "supreme": 700000,
+        "arcadion supreme": 700000,
+        "supremo": 700000,
+        "arcadion supremo": 700000,
+        "3": 1250000,
+        "mecha commander": 1250000,
+        "arcadion mecha commander": 1250000,
+    }
+    return targets.get(normalized)
+
+
 def parse_unit_change_args(
     bull: str | None = None,
     rhino: str | None = None,
@@ -629,6 +649,35 @@ def register_commands(bot: ArcadionBot) -> None:
         bot.set_raid_leader(raid_id, interaction.user.id)
         raid = bot.store.get_raid(raid_id)
         await interaction.response.send_message(embed=raid_created_embed(raid))
+
+    @bot.tree.command(name="arcadion_army", description="Configure the active raid's Arcadion army.")
+    @app_commands.checks.has_permissions(manage_guild=True)
+    async def arcadion_army(
+        interaction: discord.Interaction,
+        bulls: str = "0",
+        rhinos: str = "0",
+        lieutenants: str = "0",
+        generals: str = "0",
+        mechas: str = "0",
+    ) -> None:
+        raid = bot.store.get_active_raid()
+        if raid is None:
+            await interaction.response.send_message("There is no active raid to configure.", ephemeral=True)
+            return
+        if not bot.is_raid_admin(raid, interaction.user):
+            await interaction.response.send_message("You do not have permission to configure the Arcadion army.", ephemeral=True)
+            return
+        if raid["state"] != RaidState.RECRUITING.value:
+            await interaction.response.send_message("The Arcadion army can only be configured before the raid starts.", ephemeral=True)
+            return
+        try:
+            units = units_from_args(bulls, rhinos, lieutenants, generals, mechas)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+        bot.store.update_arcadion_units(raid["id"], units)
+        updated = bot.store.get_raid(raid["id"])
+        await interaction.response.send_message(embed=arcadion_army_embed(updated), ephemeral=True)
 
     @bot.tree.command(name="raid_join", description="Send troops to the recruiting raid.")
     async def raid_join(interaction: discord.Interaction) -> None:
@@ -1101,13 +1150,22 @@ def attack_dice_count(store: Store, raid_id: int, discord_id: int) -> int:
     return 3
 
 
+def active_combat_unit_state(participant: object) -> dict[str, bool]:
+    return {
+        "bulls": int(participant["bulls_hp"] or 0) > 0,
+        "rhinos": int(participant["rhinos_hp"] or 0) > 0,
+        "lieutenants": int(participant["lieutenants_hp"] or 0) > 0,
+        "generals": int(participant["generals_hp"] or 0) > 0,
+        "mechas": int(participant["mechas_hp"] or 0) > 0,
+    }
+
+
 def attack_dice_capacity(participant: object) -> int:
-    if int(participant["mechas"] or 0) > 0:
+    active = active_combat_unit_state(participant)
+    if active["mechas"] and active["generals"]:
         return 5
-    if int(participant["generals"] or 0) > 0:
-        return 3
-    if int(participant["lieutenants"] or 0) > 0:
-        return 2
+    if active["mechas"] or active["generals"] or active["lieutenants"]:
+        return 3 if active["generals"] or active["mechas"] else 2
     return 1
 
 
@@ -1144,7 +1202,8 @@ def get_active_mecha_variant_counts(bot: ArcadionBot, raid_id: int, participant:
 
 
 def get_available_mecha_bonus_options(bot: ArcadionBot, raid_id: int, participant: object) -> list[dict[str, object]]:
-    if int(participant["mechas"] or 0) <= 0 or int(participant["mechas_hp"] or 0) <= 0:
+    active = active_combat_unit_state(participant)
+    if not active["mechas"] or not active["generals"]:
         return []
     variants = get_active_mecha_variant_counts(bot, raid_id, participant)
     options: list[dict[str, object]] = []
@@ -1171,8 +1230,13 @@ def get_available_mecha_bonus_options(bot: ArcadionBot, raid_id: int, participan
 
 
 def resolve_dice_clash(player_dice_count: int) -> dict[str, object]:
+    if player_dice_count == 5:
+        arcadion_dice_count = 5
+    elif random.random() < 0.30:
+        arcadion_dice_count = player_dice_count
+    else:
+        arcadion_dice_count = 5
     player_roll = roll_dice(player_dice_count)
-    arcadion_dice_count = random.randint(ARCADION_DICE_MIN, ARCADION_DICE_MAX)
     arcadion_roll = roll_dice(arcadion_dice_count)
     player_successes = count_dice_successes(player_roll.rolls)
     arcadion_successes = count_dice_successes(arcadion_roll.rolls)
@@ -1228,6 +1292,7 @@ def apply_mecha_bonus(
         "bonus_label": None,
         "details": None,
         "ignore_guard": False,
+        "avoid_counterattack": False,
     }
     if bonus_choice is None:
         return result
@@ -1254,18 +1319,38 @@ def apply_mecha_bonus(
         return result
 
     if bonus_type == "heal":
-        healing = max(0, int(combat_power_from_row(participant) * 0.6))
-        if healing <= 0:
-            result["details"] = "No healing was applied."
+        candidates = []
+        for ally in bot.store.list_active_participants(int(raid["id"])):
+            counts = Units.from_row(ally)
+            current_health = combat_health_from_row(ally)
+            maximum_power = counts.power()
+            current_power = combat_power_from_row(ally)
+            if current_power < maximum_power:
+                candidates.append((ally, current_power, maximum_power, current_health))
+        if not candidates:
+            result["details"] = "No allied commander requires repair."
             return result
-        bot.store.heal_participant_units(int(raid["id"]), participant["discord_id"], healing)
+        lowest_power = min(candidate[1] for candidate in candidates)
+        weakest = [candidate for candidate in candidates if candidate[1] == lowest_power]
+        target, _, maximum_power, before_health = random.choice(weakest)
+        requested_healing = max(0, int(maximum_power * 0.6))
+        bot.store.heal_participant_units(int(raid["id"]), target["discord_id"], requested_healing)
+        refreshed_target = bot.store.get_participant(int(raid["id"]), target["discord_id"])
+        restored = 0
+        if refreshed_target is not None:
+            after_health = combat_health_from_row(refreshed_target)
+            restored = max(0, sum(after_health.values()) - sum(before_health.values()))
+        if restored <= 0:
+            result["details"] = "No allied commander requires repair."
+            return result
         result["activated"] = True
-        result["details"] = f"Restored {format_number(healing)} battle power"
+        result["details"] = f"Target: {target['discord_name']} | Restored: {format_number(restored)} battle power"
         return result
 
     if bonus_type in {"avoid_bonus_attack", "redirect_bonus_attack"}:
         result["activated"] = True
         if bonus_type == "avoid_bonus_attack":
+            result["avoid_counterattack"] = True
             result["details"] = "Arcadion's special bonus attack was avoided."
         else:
             result["details"] = "Arcadion's special bonus attack was redirected."
@@ -1333,15 +1418,33 @@ async def resolve_classic_attack(
         await interaction.response.send_message(f"It's not your turn. The turn currently belongs to @{current_holder_name}", ephemeral=True)
         return
 
+    current_capacity = attack_dice_capacity(participant)
+    if dice_count not in (1, 2, 3, 5) or dice_count > current_capacity:
+        await interaction.response.send_message(
+            f"Your army changed during this attack. Your current army allows a maximum of {current_capacity} dice. Please select your dice again.",
+            ephemeral=True,
+        )
+        return
+
     if raid["turn_deadline_at"] and datetime.fromisoformat(raid["turn_deadline_at"]) <= datetime.now(timezone.utc):
         current_player = bot.store.get_participant(raid["id"], raid["current_turn_discord_id"])
     bot.cancel_turn_timeout(raid["id"])
     clash = resolve_dice_clash(dice_count)
-    if interaction.channel is not None:
-        await interaction.channel.send(format_dice_clash_message(interaction.user.display_name, clash))
 
     attacker_roll = clash["player_roll"]
     bonus_result = apply_mecha_bonus(bot, raid, participant, bonus_choice, clash["winner"] == "PLAYER")
+    if (
+        bonus_choice is not None
+        and str(bonus_choice["ability_name"]) == "High Flight"
+        and clash["winner"] == "ARCADION"
+    ):
+        original_rolls = clash["arcadion_roll"].rolls
+        reduced_rolls = [max(1, roll - 2) for roll in original_rolls]
+        bonus_result["details"] = (
+            "Arcadion's attack hits the commander. "
+            f"Dice effect: Original: {format_dice_rolls(original_rolls)} | "
+            f"High Flight: {format_dice_rolls(reduced_rolls)}"
+        )
     if bonus_result["bonus_label"] and interaction.channel is not None:
         bonus_label = bonus_result["bonus_label"] or "Mecha Bonus"
         bonus_state = "BONUS ACTIVATED" if bonus_result["activated"] else "BONUS NOT ACTIVATED"
@@ -1379,7 +1482,7 @@ async def resolve_classic_attack(
     destroyed = Units()
     wounded_lines: list[str] = []
     counterattack_message = None
-    if target is not None:
+    if target is not None and not bonus_result["avoid_counterattack"]:
         target_units = Units.from_row(target)
         target_health = combat_health_from_row(target)
         remaining_units, destroyed_units, remaining_health, absorbed_damage = apply_wounded_combat_damage(target_units, target_health, arcadion_roll.damage)
@@ -1920,6 +2023,16 @@ class RaidLoadoutVariantView(discord.ui.View):
             return
         self.bot.store.set_participant_loaded_variants(self.raid_id, self.user_id, self.variant_counts)
         await interaction.response.edit_message(content="\n".join(["Raid loadout saved.", self._message()]), view=None)
+        participant = self.bot.store.get_participant(self.raid_id, self.user_id)
+        if participant is not None and interaction.channel is not None:
+            saved_variants = self.bot.store.get_participant_loaded_variants(self.raid_id, self.user_id)
+            await interaction.channel.send(
+                embed=joined_embed(
+                    participant["discord_name"],
+                    Units.from_row(participant),
+                    saved_variants,
+                )
+            )
 
 
 class ArmyVariantSetupView(discord.ui.View):
@@ -2187,10 +2300,64 @@ def loot_summary_embed(raid: object, participants: list[object], result_message:
     return embed
 
 
-def joined_embed(name: str, units: Units) -> discord.Embed:
-    embed = discord.Embed(title=f"??? {name} joins the raid", color=0x2E8B57)
-    embed.add_field(name="Troops Sent", value=format_units(units), inline=False)
-    embed.add_field(name="Raid Power", value=format_number(units.power()), inline=False)
+def joined_embed(name: str, units: Units, variants: dict[str, int] | None = None) -> discord.Embed:
+    embed = discord.Embed(title="🛡️ COMMANDER DEPLOYED", color=0x2E8B57)
+    force_lines = []
+    for key, label in (
+        ("bulls", "Bull Soldiers"),
+        ("rhinos", "Rhino Soldiers"),
+        ("lieutenants", "Lion Lieutenants"),
+    ):
+        amount = int(getattr(units, key))
+        if amount:
+            force_lines.append(f"{label} ×{amount}")
+    variant_keys = (
+        "general_dolphin",
+        "general_eagle",
+        "mecha_lion",
+        "mecha_eagle",
+        "mecha_dolphin",
+        "mecha_tiger",
+        "mecha_bull",
+        "mecha_black_lion",
+        "mecha_shark",
+    )
+    if variants is None:
+        if units.generals:
+            force_lines.append(f"Generals ×{units.generals}")
+        if units.mechas:
+            force_lines.append(f"Mechas ×{units.mechas}")
+    else:
+        for key in variant_keys:
+            amount = int(variants.get(key, 0))
+            if amount:
+                force_lines.append(f"{army_variant_emoji(key)} {army_variant_label(key)} ×{amount}")
+    embed.add_field(name=f"⚔️ {name} has joined the battle!", value="\u200b", inline=False)
+    embed.add_field(name="🪖 Forces Deployed", value="\n".join(force_lines) or "No units", inline=False)
+    embed.add_field(name="⚡ Military Power", value=format_number(units.power()), inline=True)
+    embed.add_field(name="🔥 Status", value="Ready to stand against Arcadion.", inline=False)
+    return embed
+
+
+def arcadion_army_embed(raid: object) -> discord.Embed:
+    units = Units.from_row(raid, "arcadion_")
+    current_power = combat_power_from_row(raid, "arcadion_")
+    target = arcadion_target_power(raid["level"])
+    target_text = format_number(target) if target is not None else "Not defined for this level"
+    embed = discord.Embed(title="☣️ ARCADION ARMY", color=0x8B0000)
+    embed.add_field(name="Level", value=str(raid["level"]), inline=True)
+    embed.add_field(name="⚔️ Military Power", value=f"{format_number(current_power)} / {target_text}", inline=False)
+    embed.add_field(
+        name="Army",
+        value=(
+            f"🐂 Bulls: {units.bulls}\n"
+            f"🦏 Rhinos: {units.rhinos}\n"
+            f"🦁 Lieutenants: {units.lieutenants}\n"
+            f"🦅 Generals: {units.generals}\n"
+            f"🤖 Mechas: {units.mechas}"
+        ),
+        inline=False,
+    )
     return embed
 
 
@@ -2220,31 +2387,56 @@ def attack_embed(
     wounded_lines: list[str] | None,
     result_message: str | None,
 ) -> discord.Embed:
-    embed = discord.Embed(title=f"?? {attacker_name.upper()} ATTACKS", color=0xDAA520)
-    embed.add_field(name="Dice", value=attacker_roll.text, inline=False)
-    embed.add_field(name="Classic Damage", value=format_number(attacker_roll.damage), inline=False)
-    if bonus_label is not None:
-        bonus_state = "BONUS ACTIVATED" if bonus_activated else "BONUS NOT ACTIVATED"
-        extra = bonus_details if bonus_details else bonus_state
-        embed.add_field(name="Mecha Bonus", value=f"{bonus_label}\n{extra}", inline=False)
-        embed.add_field(name="Bonus Damage", value=format_number(bonus_damage), inline=False)
-    embed.add_field(name="Total Damage", value=format_number(attacker_roll.damage + bonus_damage), inline=False)
+    player_rolls = " · ".join(str(roll) for roll in getattr(attacker_roll, "rolls", [])) or "No dice"
+    arcadion_rolls = " · ".join(str(roll) for roll in getattr(arcadion_roll, "rolls", [])) or "No dice"
+    embed = discord.Embed(title=f"⚔️ {attacker_name.upper()} ATTACKS ARCADION", color=0xDAA520)
+
     embed.add_field(
-        name="Arcadion",
-        value=f"{format_number(raid['current_corruption'])} / {format_number(raid['max_corruption'])}",
-        inline=False,
+        name="🎲 DICE CLASH",
+        value=(
+            f"**{attacker_name}**\n"
+            f"🎲 {player_rolls}\n"
+            f"✅ {count_dice_successes(getattr(attacker_roll, 'rolls', []))} successes"
+        ),
+        inline=True,
     )
-    embed.add_field(name="Damage to Corruption", value=format_number(damage_to_corruption), inline=True)
-    embed.add_field(name="Corrupted Guard Destroyed", value=format_units(arcadion_guard_destroyed), inline=False)
-    embed.add_field(name="?? ARCADION RETALIATES", value="\u200b", inline=False)
-    embed.add_field(name="Dice", value=arcadion_roll.text, inline=True)
-    embed.add_field(name="Damage", value=format_number(arcadion_roll.damage), inline=True)
-    embed.add_field(name="Target", value=target_name, inline=False)
-    embed.add_field(name="Destroyed Units", value=format_units(destroyed), inline=False)
+    embed.add_field(
+        name="💥 DAMAGE",
+        value=(
+            f"Classic: **{format_number(attacker_roll.damage)}**\n"
+            + (f"Mecha Bonus: **+{format_number(bonus_damage)}**\n" if bonus_label is not None else "")
+            + f"Total: **{format_number(attacker_roll.damage + bonus_damage)}**"
+        ),
+        inline=True,
+    )
+    if bonus_label is not None:
+        bonus_state = "✅ ACTIVATED" if bonus_activated else "❌ NOT ACTIVATED"
+        bonus_value = f"{bonus_label}\n{bonus_state}"
+        if bonus_details:
+            bonus_value += f"\n{bonus_details}"
+        embed.add_field(name="🤖 MECHA BONUS", value=bonus_value, inline=False)
+
+    arcadion_value = (
+        f"Corruption: **{format_number(raid['current_corruption'])} / "
+        f"{format_number(raid['max_corruption'])}**\n"
+        f"Damage to corruption: **{format_number(damage_to_corruption)}**"
+    )
+    if arcadion_guard_destroyed.has_any():
+        arcadion_value += f"\nGuard destroyed: **{format_units(arcadion_guard_destroyed)}**"
+    embed.add_field(name="☠️ ARCADION", value=arcadion_value, inline=False)
+
+    retaliation_value = (
+        f"🎲 {arcadion_rolls}\n"
+        f"💥 **{format_number(arcadion_roll.damage)} damage**\n"
+        f"🎯 Target: **{target_name}**"
+    )
+    if destroyed.has_any():
+        retaliation_value += f"\n❌ {format_units(destroyed)}"
     if wounded_lines:
-        embed.add_field(name="Wounded Units", value="\n".join(wounded_lines), inline=False)
+        retaliation_value += f"\n🩹 {'; '.join(wounded_lines)}"
+    embed.add_field(name="⚡ ARCADION RETALIATES", value=retaliation_value, inline=False)
     if result_message:
-        embed.add_field(name="Result", value=result_message, inline=False)
+        embed.add_field(name="➡️ RESULT", value=result_message, inline=False)
     return embed
 
 
